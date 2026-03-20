@@ -2,7 +2,7 @@
 
 Group Enhancer for Bases adds extra functionality to grouped views in [Obsidian Bases](https://obsidian.md/bases).
 
-![Group Enhancer for Bases](screenshot.gif)
+<img src="screenshot.gif" width="400" />
 
 ## Features
 
