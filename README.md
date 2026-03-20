@@ -2,6 +2,8 @@
 
 Group Enhancer for Bases adds extra functionality to grouped views in [Obsidian Bases](https://obsidian.md/bases).
 
+[View animated screenshot](assets/screenshot.gif)
+
 ## Features
 
 - Collapse and expand grouped sections
