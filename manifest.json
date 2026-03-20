@@ -1,0 +1,12 @@
+{
+	"id": "group-enhancer-for-bases",
+	"name": "Group Enhancer for Bases",
+	"version": "0.1.0",
+	"minAppVersion": "1.10.0",
+	"description": "Provides enhanced features for grouped views in Obsidian Bases.",
+	"author": "TfTHacker",
+	"isDesktopOnly": false,
+	"fundingUrl": {
+		"Visit my site": "https://x.com/tfthacker"
+	}
+}

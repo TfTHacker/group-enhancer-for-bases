@@ -1,0 +1,53 @@
+/* Group Enhancer for Bases */
+
+.cgb-chevron {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    margin-right: 6px;
+    flex-shrink: 0;
+    transition: transform 150ms ease;
+    cursor: pointer;
+    opacity: 0.7;
+}
+
+.cgb-chevron:hover {
+    opacity: 1;
+}
+
+.cgb-chevron.is-collapsed {
+    transform: rotate(-90deg);
+}
+
+.cgb-toolbar {
+    display: flex;
+    gap: 6px;
+    padding: 4px 8px;
+    border-bottom: 1px solid var(--background-modifier-border);
+    justify-content: flex-end;
+    align-items: center;
+}
+
+.cgb-toolbar-btn {
+    font-size: var(--font-ui-smaller);
+    color: var(--text-muted);
+    background: none;
+    border: 1px solid var(--background-modifier-border);
+    border-radius: var(--radius-s);
+    padding: 2px 8px;
+    cursor: pointer;
+    line-height: 1.4;
+}
+
+.cgb-toolbar-btn:hover {
+    color: var(--text-normal);
+    background: var(--background-modifier-hover);
+}
+
+.cgb-count-badge {
+    font-size: var(--font-ui-smaller);
+    color: var(--text-muted);
+    margin-left: 6px;
+}
