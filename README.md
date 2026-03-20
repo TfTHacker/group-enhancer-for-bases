@@ -53,6 +53,11 @@ Group Enhancer for Bases adds extra functionality to grouped views in [Obsidian 
 - Behavior is controlled through global plugin settings.
 - The plugin has been tested on both small and large grouped datasets.
 
+## Origin
+
+This plugin was originally inspired by the Obsidian forum feature request:
+- [Add ability to fold groups in Bases views](https://forum.obsidian.md/t/add-ability-to-fold-groups-in-bases-views/106822)
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
