@@ -50,6 +50,7 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 	private _foldState: Record<string, boolean> = {};
 	private _collapsedKeys: Set<string> = new Set();
 	private _observer: MutationObserver | null = null;
+	private _embedObserver: MutationObserver | null = null;
 	private _patchTimer: ReturnType<typeof setTimeout> | null = null;
 	private _refreshTimer: ReturnType<typeof setTimeout> | null = null;
 	private _styleEl: HTMLStyleElement | null = null;
@@ -116,9 +117,58 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 					this._refreshAllGroupedViews();
 				} else {
 					this._setInitializingState(false);
+					// May be a markdown leaf with embedded bases — patch those
+					this._refreshEmbeddedInActiveLeaf();
 				}
 			}, 120);
 		});
+
+		// Watch for embedded bases appearing in the DOM
+		this._setupEmbedObserver();
+	}
+
+	private _setupEmbedObserver() {
+		if (this._embedObserver) return;
+		this._embedObserver = new MutationObserver((mutations) => {
+			let hasNewEmbeds = false;
+			for (const mutation of mutations) {
+				const nodes = Array.from(mutation.addedNodes);
+				for (const node of nodes) {
+					if (node.nodeType !== 1) continue;
+					const el = node as HTMLElement;
+					if (el.classList?.contains('bases-view') ||
+						el.querySelector?.('.bases-view.is-grouped')) {
+						hasNewEmbeds = true;
+						break;
+					}
+				}
+				if (hasNewEmbeds) break;
+			}
+			if (hasNewEmbeds) {
+				if (this._refreshTimer) clearTimeout(this._refreshTimer);
+				this._refreshTimer = setTimeout(() => {
+					this._refreshEmbeddedInActiveLeaf();
+				}, 150);
+			}
+		});
+		this._embedObserver.observe(document.body, { childList: true, subtree: true });
+	}
+
+	private _refreshEmbeddedInActiveLeaf() {
+		const leaf = this.app.workspace.activeLeaf;
+		if (!leaf) return;
+		const container = leaf.view?.containerEl as HTMLElement | undefined;
+		if (!container) return;
+		const embedEls = container.querySelectorAll<HTMLElement>('.internal-embed.bases-embed');
+		embedEls.forEach(embedEl => {
+			this._patchEmbedHeaders(embedEl);
+			this._applyEmbedCollapse(embedEl);
+		});
+	}
+
+	private _patchEmbedHeaders(embedEl: HTMLElement) {
+		const headers = embedEl.querySelectorAll<HTMLElement>('.bases-group-heading');
+		headers.forEach(h => this._patchHeader(h));
 	}
 
 	/**
@@ -182,6 +232,7 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 
 	onunload() {
 		this._observer?.disconnect();
+		this._embedObserver?.disconnect();
 		if (this._patchTimer) clearTimeout(this._patchTimer);
 		if (this._refreshTimer) clearTimeout(this._refreshTimer);
 		if (this._boundPointerUp) document.removeEventListener('pointerup', this._boundPointerUp, true);
@@ -226,6 +277,8 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 .cgb-toolbar-btn.is-icon-only { padding: 4px 6px; gap: 0; }
 .cgb-count-badge { font-size: var(--font-ui-smaller); color: var(--text-muted); margin-left: 6px; }
 .bases-view.is-grouped[data-cgb-initializing="true"] { visibility: hidden; }
+.internal-embed .bases-view.is-grouped .bases-table-container { height: auto !important; }
+.internal-embed .bases-view.is-grouped .bases-table { position: relative !important; top: auto !important; }
 `;
 		document.head.appendChild(this._styleEl);
 	}
@@ -234,9 +287,11 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 		this._boundPointerUp = (e: PointerEvent) => {
 			const target = e.target as HTMLElement | null;
 			if (!target) return;
-			if (target.closest('button, a, input, [contenteditable]')) return;
 			const header = target.closest('.bases-group-heading[data-cgb-patched]') as HTMLElement | null;
 			if (!header) return;
+			// Only bail if the interactive element is INSIDE the header (not an ancestor like CM6 contenteditable)
+			const blocker = target.closest('button, a, input, [contenteditable]') as HTMLElement | null;
+			if (blocker && header.contains(blocker)) return;
 			e.preventDefault();
 			e.stopPropagation();
 
@@ -468,7 +523,53 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 		else this._collapsedKeys.add(key);
 
 		this._persistKey(key);
+
+		// For embedded views, apply collapse via CSS only (no table controller available)
+		const embedEl = header.closest('.internal-embed') as HTMLElement | null;
+		if (embedEl) {
+			this._applyEmbedCollapse(embedEl);
+			this._syncHeaderUi(header);
+			return;
+		}
+
 		this._refreshAfterStateChange(wasCollapsed ? key : undefined);
+	}
+
+	private _applyEmbedCollapse(embedEl: HTMLElement) {
+		const resolved = this._getResolvedSettings();
+		const container = embedEl.querySelector('.bases-view.is-grouped');
+		if (!container) return;
+		const src = embedEl.getAttribute('src') ?? '';
+		const headers = container.querySelectorAll<HTMLElement>('.bases-group-heading');
+		for (let i = 0; i < headers.length; i++) {
+			const h = headers[i];
+			const groupValue = this._normalizeGroupValue(h.querySelector('.bases-group-value')?.textContent?.trim());
+			const k = `${src}::${groupValue}`;
+			const collapsed = resolved.enableCollapsibleGroups && (resolved.collapseAllByDefault || this._collapsedKeys.has(k));
+			const tableEl = h.closest('.bases-table') as HTMLElement | null;
+			const tbody = tableEl?.querySelector<HTMLElement>(':scope > .bases-tbody');
+			if (tbody) tbody.style.display = collapsed ? 'none' : '';
+			this._syncHeaderUi(h);
+		}
+		// Reflow container height so the embed resizes correctly
+		this._reflowEmbed(embedEl);
+	}
+
+	private _reflowEmbed(embedEl: HTMLElement) {
+		const tableContainer = embedEl.querySelector<HTMLElement>('.bases-table-container');
+		if (!tableContainer) return;
+		const tables = tableContainer.querySelectorAll<HTMLElement>(':scope > .bases-table');
+		let top = 0;
+		for (let i = 0; i < tables.length; i++) {
+			const t = tables[i];
+			const hdr = t.querySelector<HTMLElement>(':scope > .bases-group-heading');
+			const tbody = t.querySelector<HTMLElement>(':scope > .bases-tbody');
+			const headerH = hdr?.offsetHeight ?? 40;
+			const bodyH = tbody && getComputedStyle(tbody).display !== 'none' ? (tbody.offsetHeight || 0) : 0;
+			t.style.top = `${top}px`;
+			top += headerH + bodyH;
+		}
+		tableContainer.style.height = `${top}px`;
 	}
 
 	private _collapseAll() {
@@ -706,6 +807,13 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 
 	private _headerKey(header: HTMLElement): string {
 		const groupValue = this._normalizeGroupValue(header.querySelector('.bases-group-value')?.textContent?.trim());
+		// For headers inside an embedded base, resolve the actual .base file path
+		// from the .internal-embed[src] attribute rather than the active markdown file.
+		const embedEl = header.closest('.internal-embed') as HTMLElement | null;
+		if (embedEl) {
+			const src = embedEl.getAttribute('src');
+			if (src) return `${src}::${groupValue}`;
+		}
 		return this._stateKey(groupValue);
 	}
 
