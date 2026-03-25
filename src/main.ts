@@ -449,11 +449,7 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 .cgb-count-badge { font-size: var(--font-ui-smaller); color: var(--text-muted); margin-left: 6px; }
 .bases-view.is-grouped[data-cgb-initializing="true"] { visibility: hidden; }
 .internal-embed .bases-view.is-grouped .bases-table[data-cgb-collapsed="true"] > .bases-tbody { display: none !important; }
-/* Embed: keep virtual positioning on .bases-table so groups are correctly positioned.
-   Container overflow visible. Tbody height auto so rows don't reserve unused space. */
 .internal-embed .bases-view.is-grouped .bases-table-container { overflow: visible !important; }
-.internal-embed .bases-view.is-grouped .bases-tbody { height: auto !important; }
-.internal-embed .bases-view.is-grouped .bases-tbody > .bases-tr { position: static !important; top: auto !important; }
 .canvas-node-content .bases-view.is-grouped .bases-table-container { height: auto !important; }
 .canvas-node-content .bases-view.is-grouped .bases-table[data-cgb-collapsed="true"] > .bases-tbody { display: none !important; }
 `;
@@ -805,20 +801,6 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 			this._syncHeaderUi(header);
 			this._applyCollapsedModelToEmbed(embedEl);
 			
-			// If expanding a group, scroll it into view
-			if (wasCollapsed) {
-				requestAnimationFrame(() => {
-					const table = header.closest('.bases-table');
-					if (table) {
-						const tableRect = table.getBoundingClientRect();
-						const viewportHeight = window.innerHeight;
-						// If the table is outside the viewport (or only partially visible)
-						if (tableRect.top < 0 || tableRect.bottom > viewportHeight) {
-							table.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-						}
-					}
-				});
-			}
 			return;
 		}
 
@@ -1038,7 +1020,7 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 					return clone;
 				});
 			}
-			return origUpdate();
+				return origUpdate();
 		};
 	}
 
@@ -1060,6 +1042,28 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 			maxBottom = Math.max(maxBottom, top + headerH + bodyH);
 		}
 		if (maxBottom > 0) container.style.height = `${maxBottom}px`;
+	}
+
+	private _recalculateEmbedTablePositions(embedEl: HTMLElement) {
+		// Recalculate top positions based on actual rendered heights, not virtual heights.
+		// This eliminates gaps between groups in embeds.
+		const container = embedEl.querySelector('.bases-table-container') as HTMLElement | null;
+		if (!container) return;
+		const tables = Array.from(container.querySelectorAll<HTMLElement>(':scope > .bases-table'));
+		
+		let currentTop = 0;
+		for (const t of tables) {
+			const header = t.querySelector<HTMLElement>(':scope > .bases-group-heading');
+			const tbody = t.querySelector<HTMLElement>(':scope > .bases-tbody');
+			const headerH = header?.offsetHeight ?? 40;
+			const bodyH = tbody ? tbody.offsetHeight : 0;
+			
+			t.style.top = `${currentTop}px`;
+			currentTop += headerH + bodyH;
+		}
+		
+		// Update container height
+		container.style.height = `${currentTop}px`;
 	}
 
 	private _watchEmbedVisibility(embedEl: HTMLElement) {
