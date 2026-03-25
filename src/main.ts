@@ -1562,12 +1562,18 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 		await this.saveData(data);
 		// Mark cache as dirty since global settings changed
 		this._baseConfigCacheDirty = true;
-		// If collapsible groups disabled, remove all chevrons and patched markers
+		// If collapsible groups disabled, remove all chevrons, patched markers, and collapse state
 		if (!this.settings.enableCollapsibleGroups) {
 			document.querySelectorAll('.cgb-chevron').forEach(el => el.remove());
 			document.querySelectorAll('[data-cgb-patched]').forEach(el => {
 				el.removeAttribute('data-cgb-patched');
 				(el as HTMLElement).style.cursor = '';
+			});
+			// Remove collapse attributes and restore tbody heights so records show again
+			document.querySelectorAll('[data-cgb-collapsed]').forEach(el => {
+				el.removeAttribute('data-cgb-collapsed');
+				const tbody = el.querySelector<HTMLElement>(':scope > .bases-tbody');
+				if (tbody) tbody.style.height = '';
 			});
 			this._patchedHeaders.clear();
 			this._headerKeyCache.clear();
