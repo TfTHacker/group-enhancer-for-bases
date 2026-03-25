@@ -333,6 +333,7 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 	}
 
 	private _patchEmbedHeaders(embedEl: HTMLElement) {
+		if (!this._getResolvedSettings().enableCollapsibleGroups) return;
 		const headers = embedEl.querySelectorAll<HTMLElement>('.bases-group-heading');
 		headers.forEach(h => this._patchHeader(h));
 	}
@@ -643,6 +644,7 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 	}
 
 	private _patchHeaders() {
+		if (!this._getResolvedSettings().enableCollapsibleGroups) return;
 		// Patch all headers that are currently in the DOM
 		const allHeaders = document.querySelectorAll<HTMLElement>('.bases-group-heading');
 		const headerCount = allHeaders.length;
