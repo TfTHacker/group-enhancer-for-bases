@@ -830,6 +830,13 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 				// Use data attribute so CSS !important rule survives virtual renderer re-renders
 				if (collapsed) tableEl.setAttribute('data-cgb-collapsed', 'true');
 				else tableEl.removeAttribute('data-cgb-collapsed');
+				// Zero out tbody inline height when collapsed so Bases positions next group
+				// immediately below the header (not after the full virtual scroll height)
+				const tbody = tableEl.querySelector<HTMLElement>(':scope > .bases-tbody');
+				if (tbody) {
+					if (collapsed) tbody.style.height = '0px';
+					// When expanding, let Bases' updateVirtualDisplay restore the correct height
+				}
 			}
 			this._syncHeaderUi(h);
 		}
