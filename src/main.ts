@@ -800,7 +800,7 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 			this._applyEmbedCollapse(embedEl);
 			this._syncHeaderUi(header);
 			this._applyCollapsedModelToEmbed(embedEl);
-			
+			requestAnimationFrame(() => { this._repackEmbedTables(embedEl); });
 			return;
 		}
 
@@ -992,11 +992,12 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 		table.display?.();
 		table.updateVirtualDisplay?.();
 
-		// Patch headers after display() re-creates them, fix container height
+		// Patch headers after display() re-creates them, fix container height and repack
 		requestAnimationFrame(() => {
 			this._patchEmbedHeaders(embedEl);
 			this._patchToolbars();
 			this._fixEmbedContainerHeight(embedEl, table);
+			this._repackEmbedTables(embedEl);
 			requestAnimationFrame(() => {
 				this._rerenderingEmbed = false;
 			});
@@ -1027,8 +1028,24 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 					return clone;
 				});
 			}
-				return origUpdate();
+				const result = origUpdate();
+			// After virtual display runs, repack table top positions using actual heights
+			requestAnimationFrame(() => { self._repackEmbedTables(embedEl); });
+			return result;
 		};
+	}
+
+	private _repackEmbedTables(embedEl: HTMLElement) {
+		const container = embedEl.querySelector<HTMLElement>('.bases-table-container');
+		if (!container) return;
+		const tables = Array.from(container.querySelectorAll<HTMLElement>(':scope > .bases-table'));
+		if (!tables.length) return;
+		let top = 0;
+		for (const t of tables) {
+			t.style.top = `${top}px`;
+			top += t.offsetHeight;
+		}
+		container.style.height = `${top}px`;
 	}
 
 	private _fixEmbedContainerHeight(embedEl: HTMLElement, table: BasesTableView) {
