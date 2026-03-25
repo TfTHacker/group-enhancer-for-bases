@@ -155,14 +155,20 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 		if (!scroller) return;
 
 		let ticking = false;
+		let scrollTimer: ReturnType<typeof setTimeout> | null = null;
 		const handler = () => {
 			if (ticking) return;
 			ticking = true;
 			requestAnimationFrame(() => {
 				ticking = false;
-				// Check for unpatched embeds that CM virtualization may have just created.
-				// Delay slightly to let Bases finish its own initialization after CM renders.
-				setTimeout(() => this._refreshEmbeddedInActiveLeaf(), 200);
+				// Debounce: only fire 300ms after scrolling stops.
+				// This avoids calling _applyCollapsedModelToEmbed multiple times during a
+				// single scroll gesture as CM virtualizes the embed into view.
+				if (scrollTimer) clearTimeout(scrollTimer);
+				scrollTimer = setTimeout(() => {
+					scrollTimer = null;
+					this._refreshEmbeddedInActiveLeaf();
+				}, 300);
 			});
 		};
 
@@ -263,10 +269,11 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 			this._applyEmbedCollapse(embedEl);
 			// Watch for embed scrolling into view so Bases can render all rows
 			this._watchEmbedVisibility(embedEl);
-			// Apply data model on first load only (when headers haven't been patched yet).
-			// Re-entry is handled by _rerenderingEmbed guard.
-			const isFirstLoad = !embedEl.querySelector('.bases-group-heading[data-cgb-patched]');
-			if (isFirstLoad && !this._rerenderingEmbed) {
+			// Apply data model if not yet done for this embed instance.
+			// Use a flag rather than header-patched check to avoid race conditions.
+			const notYetInitialized = !(embedEl as HTMLElement & { __cgbModelApplied?: boolean }).__cgbModelApplied;
+			if (notYetInitialized && !this._rerenderingEmbed) {
+				(embedEl as HTMLElement & { __cgbModelApplied?: boolean }).__cgbModelApplied = true;
 				this._applyCollapsedModelToEmbed(embedEl);
 			}
 		});
