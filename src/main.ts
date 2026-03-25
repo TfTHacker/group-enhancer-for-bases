@@ -45,6 +45,7 @@ type BasesTableView = {
 	createGroupHeadingEl?: (group: BasesGroup) => HTMLElement | null;
 	__cgbOriginalGroupedData?: BasesGroup[];
 	__cgbGroupCountMap?: Record<string, number>;
+	__cgbGapFixerInstalled?: boolean;
 };
 
 export default class CollapsibleGroupsPlugin extends Plugin {
@@ -938,6 +939,45 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 
 		table.display?.();
 		table.updateVirtualDisplay?.();
+		this._fixGroupGaps(table);
+		this._installGapFixer(table);
+	}
+
+	private _installGapFixer(table: BasesTableView) {
+		// Patch updateVirtualDisplay on the table instance so _fixGroupGaps runs after every call.
+		// This prevents Bases' scroll watcher from adding gaps back.
+		if ((table as unknown as Record<string, unknown>).__cgbGapFixerInstalled) return;
+		(table as unknown as Record<string, unknown>).__cgbGapFixerInstalled = true;
+		const original = table.updateVirtualDisplay!.bind(table);
+		const self = this;
+		(table as unknown as Record<string, unknown>).updateVirtualDisplay = function(this: BasesTableView) {
+			const result = original();
+			self._fixGroupGaps(this);
+			return result;
+		};
+	}
+
+	private _fixGroupGaps(table: BasesTableView) {
+		// After updateVirtualDisplay, Bases has positioned tables with --bases-table-group-gap
+		// between each group. Recompute top values without the gap for compact collapsed layout.
+		const container = table.containerEl;
+		if (!container) return;
+		const tables = container.querySelectorAll<HTMLElement>(':scope > .bases-table');
+		let top = 0;
+		for (let i = 0; i < tables.length; i++) {
+			const t = tables[i];
+			t.style.top = `${top}px`;
+			// Height = header height (from BCR) + tbody height (from inline style, 0 for collapsed)
+			const heading = t.querySelector<HTMLElement>(':scope > .bases-group-heading');
+			const tbody = t.querySelector<HTMLElement>(':scope > .bases-tbody');
+			const headingH = heading ? heading.getBoundingClientRect().height : 30;
+			const tbodyH = tbody ? parseInt(tbody.style.height || '0', 10) : 0;
+			top += headingH + tbodyH;
+		}
+		// Update container height to match
+		if (container.parentElement) {
+			container.style.height = `${top}px`;
+		}
 	}
 
 	private _resetGroupedDataCache() {
