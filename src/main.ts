@@ -190,6 +190,13 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 			this._patchEmbedHeaders(embedEl);
 			this._applyEmbedCollapse(embedEl);
 		});
+		// Re-apply reflow after Bases' own renderer may have re-set positioning
+		setTimeout(() => {
+			embedEls.forEach(embedEl => this._reflowEmbed(embedEl));
+		}, 100);
+		setTimeout(() => {
+			embedEls.forEach(embedEl => this._reflowEmbed(embedEl));
+		}, 400);
 	}
 
 	private _patchEmbedHeaders(embedEl: HTMLElement) {
@@ -303,8 +310,9 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 .cgb-toolbar-btn.is-icon-only { padding: 4px 6px; gap: 0; }
 .cgb-count-badge { font-size: var(--font-ui-smaller); color: var(--text-muted); margin-left: 6px; }
 .bases-view.is-grouped[data-cgb-initializing="true"] { visibility: hidden; }
-.internal-embed .bases-view.is-grouped .bases-table-container { height: auto !important; }
-.internal-embed .bases-view.is-grouped .bases-table { position: relative !important; top: auto !important; }
+.internal-embed .bases-view.is-grouped .bases-table-container { height: auto !important; overflow: visible !important; }
+.internal-embed .bases-view.is-grouped .bases-table { position: relative !important; top: 0 !important; width: 100% !important; }
+.internal-embed .bases-view.is-grouped .bases-table[data-cgb-collapsed="true"] > .bases-tbody { display: none !important; }
 .canvas-node-content .bases-view.is-grouped .bases-table-container { height: auto !important; }
 .canvas-node-content .bases-view.is-grouped .bases-table { position: relative !important; top: auto !important; }
 `;
@@ -669,11 +677,14 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 			const k = `${src}::${groupValue}`;
 			const collapsed = resolved.enableCollapsibleGroups && (resolved.collapseAllByDefault || this._collapsedKeys.has(k));
 			const tableEl = h.closest('.bases-table') as HTMLElement | null;
-			const tbody = tableEl?.querySelector<HTMLElement>(':scope > .bases-tbody');
-			if (tbody) tbody.style.display = collapsed ? 'none' : '';
+			if (tableEl) {
+				// Use data attribute so CSS !important rule survives virtual renderer re-renders
+				if (collapsed) tableEl.setAttribute('data-cgb-collapsed', 'true');
+				else tableEl.removeAttribute('data-cgb-collapsed');
+			}
 			this._syncHeaderUi(h);
 		}
-		// Reflow container height so the embed resizes correctly
+		// Clear virtual scroll positioning so CSS height:auto/position:relative take over
 		this._reflowEmbed(embedEl);
 	}
 
@@ -716,20 +727,17 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 	}
 
 	private _reflowEmbed(embedEl: HTMLElement) {
+		// For embeds, clear virtual scroll positioning and let CSS flow naturally.
+		// offsetHeight returns 0 for elements in CM widgets, so measurement-based
+		// reflow doesn't work. The CSS overrides (height:auto, position:relative)
+		// handle the layout instead.
 		const tableContainer = embedEl.querySelector<HTMLElement>('.bases-table-container');
 		if (!tableContainer) return;
+		tableContainer.style.height = '';
 		const tables = tableContainer.querySelectorAll<HTMLElement>(':scope > .bases-table');
-		let top = 0;
 		for (let i = 0; i < tables.length; i++) {
-			const t = tables[i];
-			const hdr = t.querySelector<HTMLElement>(':scope > .bases-group-heading');
-			const tbody = t.querySelector<HTMLElement>(':scope > .bases-tbody');
-			const headerH = hdr?.offsetHeight ?? 40;
-			const bodyH = tbody && getComputedStyle(tbody).display !== 'none' ? (tbody.offsetHeight || 0) : 0;
-			t.style.top = `${top}px`;
-			top += headerH + bodyH;
+			tables[i].style.top = '';
 		}
-		tableContainer.style.height = `${top}px`;
 	}
 
 	private _collapseAll() {
