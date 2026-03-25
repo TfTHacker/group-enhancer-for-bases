@@ -917,40 +917,12 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 			return clone;
 		});
 
-		// For embedded tables, permanently patch updateVirtualDisplay to always use a huge
-		// viewport. Without this, Bases' virtual renderer removes rows that are "off-screen"
-		// relative to the actual small embed rect — creating whitespace on expand/reload.
-		this._patchEmbedTableVirtualDisplay(table);
-
 		this._rerenderingEmbed = true;
 		table.display?.();
 		table.updateVirtualDisplay?.();
 
-		// With position:static CSS, rows added by updateVirtualDisplay stay in the DOM.
-		// But only rows visible in the current window viewport are added per call.
-		// Simulate scrolling through the page to ensure all rows get rendered.
-		this._populateAllEmbedRows(table, embedEl);
-	}
-
-	private _populateAllEmbedRows(table: BasesTableView, embedEl: HTMLElement) {
-		// With position:static CSS, rows added by updateVirtualDisplay accumulate in the DOM.
-		// We call updateVirtualDisplay at each scroll position to ensure all rows get added.
-		// All calls happen synchronously so the browser never repaints between steps — no flicker.
-		const scroller = embedEl.closest('.cm-scroller') as HTMLElement | null;
-
-		if (scroller) {
-			const origScrollTop = scroller.scrollTop;
-			const scrollHeight = scroller.scrollHeight;
-			const step = 300;
-			// Synchronous loop — no rAF between steps, browser won't repaint
-			for (let pos = 0; pos <= scrollHeight; pos += step) {
-				scroller.scrollTop = pos;
-				table.updateVirtualDisplay?.();
-			}
-			scroller.scrollTop = origScrollTop;
-		}
-
-		// Patch headers and release guard after paint
+		// With position:static CSS (see _injectStyles), rows rendered by updateVirtualDisplay
+		// take up real space — no whitespace gaps. Remaining rows load as the user scrolls.
 		requestAnimationFrame(() => {
 			this._patchEmbedHeaders(embedEl);
 			this._patchToolbars();
@@ -971,10 +943,15 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 			for (const entry of entries) {
 				if (!entry.isIntersecting) continue;
 				if (this._rerenderingEmbed) continue;
-				// Re-apply the full data model so all expanded groups get their rows rendered.
-				// updateVirtualDisplay alone isn't enough — it only renders rows in the current
-				// viewport window, so groups expanded but off-screen still appear empty.
-				this._applyCollapsedModelToEmbed(embedEl);
+				// Trigger updateVirtualDisplay so Bases renders rows now that the embed is visible.
+				const widget = (embedEl as unknown as { cmView?: { widget?: { child?: { controller?: { _children?: unknown[] } } } } })?.cmView?.widget;
+				const children = widget?.child?.controller?._children;
+				if (!Array.isArray(children)) continue;
+				const table = children.find((c: unknown) => {
+					const m = c as BasesTableView;
+					return typeof m?.display === 'function' && Array.isArray(m?.groups) && !!m?.scrollEl;
+				}) as BasesTableView | undefined;
+				table?.updateVirtualDisplay?.();
 			}
 		}, { threshold: 0.01 });
 		io.observe(embedEl);
@@ -983,10 +960,7 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 		this._embedVisibilityObservers.push(io);
 	}
 
-	// Also keep a method to patch the virtual display table for use in _applyCollapsedModelToEmbed
-	private _patchEmbedTableVirtualDisplay(_table: BasesTableView) {
-		// No-op: visibility-based update handles this now
-	}
+
 
 	private _forceEmbedRerender(embedEl: HTMLElement, _virtualTop: number) {
 		// Legacy stub — logic moved to _applyCollapsedModelToEmbed
