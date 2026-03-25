@@ -196,6 +196,13 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 		if (leaf.view?.getViewType() !== 'canvas') return;
 		this._patchToolbars();
 		this._patchHeaders();
+		// Find all canvas nodes with Bases embeds and apply collapse state
+		const canvasNodeEls = leaf.view.containerEl.querySelectorAll<HTMLElement>('.canvas-node');
+		canvasNodeEls.forEach(el => {
+			if (el.querySelector('.bases-view.is-grouped')) {
+				this._applyCanvasNodeCollapse(el);
+			}
+		});
 	}
 
 	private _refreshEmbeddedInActiveLeaf() {
@@ -896,9 +903,24 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 			return clone;
 		});
 
+		// Override containerEl.getBoundingClientRect so Bases' viewport calc treats all rows
+		// as in-view. Without this, on initial load (containerEl has height 0) Bases only
+		// renders the first group's rows — expanding any other group shows whitespace.
+		const containerEl = table.containerEl as HTMLElement | undefined;
+		let origRect: (() => DOMRect) | undefined;
+		if (containerEl) {
+			origRect = containerEl.getBoundingClientRect.bind(containerEl);
+			containerEl.getBoundingClientRect = () =>
+				({ top: -99999, bottom: 99999, left: 0, right: 0, width: 800, height: 99999 } as DOMRect);
+		}
+
 		this._rerenderingEmbed = true;
 		table.display?.();
 		table.updateVirtualDisplay?.();
+
+		// Restore original getBoundingClientRect
+		if (containerEl && origRect) containerEl.getBoundingClientRect = origRect;
+
 		// Patch headers AFTER display() re-creates them, then release the guard
 		requestAnimationFrame(() => {
 			this._patchEmbedHeaders(embedEl);
