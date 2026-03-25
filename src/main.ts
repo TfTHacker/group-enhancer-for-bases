@@ -38,8 +38,10 @@ type BasesTableView = {
 	data?: BasesData;
 	groups?: BasesGroup[];
 	scrollEl?: HTMLElement;
+	containerEl?: HTMLElement;
 	display?: () => void;
 	updateVirtualDisplay?: () => void;
+	lastViewport?: { left: number; right: number; top: number; bottom: number };
 	createGroupHeadingEl?: (group: BasesGroup) => HTMLElement | null;
 	__cgbOriginalGroupedData?: BasesGroup[];
 	__cgbGroupCountMap?: Record<string, number>;
@@ -194,7 +196,55 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 		embedEls.forEach(embedEl => {
 			this._patchEmbedHeaders(embedEl);
 			this._applyEmbedCollapse(embedEl);
+			// Only apply data model on initial load (not during observer-triggered refreshes)
+			// _applyCollapsedModelToEmbed calls display() which would cause a loop
+			if (!embedEl.querySelector('.bases-group-heading[data-cgb-patched]')) {
+				// First time patching this embed — apply the data model
+				this._applyCollapsedModelToEmbed(embedEl);
+			}
 		});
+	}
+
+	/**
+	 * On initial embed load, if any expanded groups would be hidden off-screen due to
+	 * Bases' virtual positioning, collapse all groups so all headers are visible.
+	 * A group is "off-screen" if its table has top > 0 and no data-cgb-collapsed attribute.
+	 */
+	private _autoCollapseEmbedIfNeeded(embedEl: HTMLElement) {
+		const resolved = this._getResolvedSettings();
+		if (!resolved.enableCollapsibleGroups) return;
+		const src = embedEl.getAttribute('src') ?? '';
+		const tables = embedEl.querySelectorAll<HTMLElement>('.bases-table');
+		let hasExpandedOffscreen = false;
+		for (let i = 0; i < tables.length; i++) {
+			const t = tables[i];
+			const top = parseInt(t.style.top || '0', 10);
+			const alreadyCollapsed = t.getAttribute('data-cgb-collapsed') === 'true';
+			const heading = t.querySelector('.bases-group-value')?.textContent?.trim();
+			const key = `${src}::${this._normalizeGroupValue(heading)}`;
+			const inCollapsedKeys = this._collapsedKeys.has(key) || resolved.collapseAllByDefault;
+			// If this group is not collapsed by saved state but has top > 0, it's off-screen
+			if (!inCollapsedKeys && !alreadyCollapsed && top > 0) {
+				hasExpandedOffscreen = true;
+				break;
+			}
+		}
+		if (!hasExpandedOffscreen) return;
+		// Collapse all groups for this embed
+		for (let i = 0; i < tables.length; i++) {
+			const heading = tables[i].querySelector('.bases-group-value')?.textContent?.trim();
+			const key = `${src}::${this._normalizeGroupValue(heading)}`;
+			this._collapsedKeys.add(key);
+		}
+		// Persist new keys to fold state
+		if (resolved.rememberFoldState) {
+			for (let i = 0; i < tables.length; i++) {
+				const heading = tables[i].querySelector('.bases-group-value')?.textContent?.trim();
+				const key = `${src}::${this._normalizeGroupValue(heading)}`;
+				this._foldState[key] = true;
+			}
+			this._saveFoldState();
+		}
 	}
 
 	private _patchEmbedHeaders(embedEl: HTMLElement) {
@@ -309,9 +359,9 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 .cgb-count-badge { font-size: var(--font-ui-smaller); color: var(--text-muted); margin-left: 6px; }
 .bases-view.is-grouped[data-cgb-initializing="true"] { visibility: hidden; }
 .internal-embed .bases-view.is-grouped .bases-table[data-cgb-collapsed="true"] > .bases-tbody { display: none !important; }
-/* When all groups are collapsed, reset virtual positioning so headers stack compactly */
-.internal-embed .bases-view.is-grouped[data-cgb-all-collapsed="true"] .bases-table-container { height: auto !important; overflow: visible !important; }
-.internal-embed .bases-view.is-grouped[data-cgb-all-collapsed="true"] .bases-table { position: relative !important; top: 0 !important; }
+/* Always use natural flow layout for embedded bases (override Bases virtual positioning) */
+.internal-embed .bases-view.is-grouped .bases-table-container { height: auto !important; overflow: visible !important; }
+.internal-embed .bases-view.is-grouped .bases-table { position: relative !important; top: 0 !important; }
 .canvas-node-content .bases-view.is-grouped .bases-table-container { height: auto !important; }
 .canvas-node-content .bases-view.is-grouped .bases-table { position: relative !important; top: auto !important; }
 `;
@@ -611,6 +661,7 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 		});
 		this._saveFoldState();
 		this._applyEmbedCollapse(embedEl);
+		this._applyCollapsedModelToEmbed(embedEl);
 	}
 
 	private _expandAllInEmbed(embedEl: HTMLElement) {
@@ -629,6 +680,7 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 		});
 		this._saveFoldState();
 		this._applyEmbedCollapse(embedEl);
+		this._applyCollapsedModelToEmbed(embedEl);
 	}
 
 	private _toggle(header: HTMLElement) {
@@ -646,15 +698,12 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 
 		this._persistKey(key);
 
-		// For markdown-embedded views, apply collapse via CSS only
+		// For markdown-embedded views, apply collapse via data model + CSS
 		const embedEl = header.closest('.internal-embed') as HTMLElement | null;
 		if (embedEl) {
 			this._applyEmbedCollapse(embedEl);
 			this._syncHeaderUi(header);
-			// If we just expanded a group, force the embedded table to re-render rows
-			if (wasCollapsed) {
-				this._forceEmbedRerender(embedEl);
-			}
+			this._applyCollapsedModelToEmbed(embedEl);
 			return;
 		}
 
@@ -674,13 +723,11 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 		if (!container) return;
 		const src = embedEl.getAttribute('src') ?? '';
 		const headers = container.querySelectorAll<HTMLElement>('.bases-group-heading');
-		let allCollapsed = headers.length > 0;
 		for (let i = 0; i < headers.length; i++) {
 			const h = headers[i];
 			const groupValue = this._normalizeGroupValue(h.querySelector('.bases-group-value')?.textContent?.trim());
 			const k = `${src}::${groupValue}`;
 			const collapsed = resolved.enableCollapsibleGroups && (resolved.collapseAllByDefault || this._collapsedKeys.has(k));
-			if (!collapsed) allCollapsed = false;
 			const tableEl = h.closest('.bases-table') as HTMLElement | null;
 			if (tableEl) {
 				// Use data attribute so CSS !important rule survives virtual renderer re-renders
@@ -689,10 +736,6 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 			}
 			this._syncHeaderUi(h);
 		}
-		// When all groups are collapsed, override virtual positioning so headers stack compactly.
-		// When any group is expanded, remove override so Bases' virtual renderer can render rows.
-		if (allCollapsed) container.setAttribute('data-cgb-all-collapsed', 'true');
-		else container.removeAttribute('data-cgb-all-collapsed');
 	}
 
 	private _applyCanvasNodeCollapse(canvasNodeEl: HTMLElement) {
@@ -733,8 +776,12 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 		tableContainer.style.height = `${top}px`;
 	}
 
-	private _forceEmbedRerender(embedEl: HTMLElement) {
-		// After expanding a group, force Bases to re-render rows into the now-visible tbody.
+	private _applyCollapsedModelToEmbed(embedEl: HTMLElement) {
+		// Like _applyCollapsedModelToActiveTable but for embedded bases views.
+		// Modifies the embedded table's groupedDataCache so collapsed groups have 0 entries,
+		// making Bases' virtual renderer position all groups compactly.
+		const resolved = this._getResolvedSettings();
+		const src = embedEl.getAttribute('src') ?? '';
 		const widget = (embedEl as unknown as { cmView?: { widget?: { child?: { controller?: { _children?: unknown[] } } } } })?.cmView?.widget;
 		const children = widget?.child?.controller?._children;
 		if (!Array.isArray(children)) return;
@@ -742,20 +789,47 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 			const m = c as BasesTableView;
 			return typeof m?.display === 'function' && Array.isArray(m?.groups) && !!m?.scrollEl;
 		}) as BasesTableView | undefined;
-		if (!table) return;
+		if (!table?.data) return;
+
+		// Save original data if not already saved
+		if (!table.__cgbOriginalGroupedData) {
+			const previousCache = table.data.groupedDataCache;
+			table.data.groupedDataCache = null;
+			table.__cgbOriginalGroupedData = (table.data.groupedData ?? []).map(group => ({
+				...group,
+				entries: group.entries.slice(),
+			} as BasesGroup));
+			table.data.groupedDataCache = previousCache ?? null;
+		}
+
+		table.data.groupedDataCache = table.__cgbOriginalGroupedData.map(group => {
+			const clone = { ...group } as BasesGroup;
+			const groupValue = this._normalizeGroupValue(this._groupValue(group));
+			const key = `${src}::${groupValue}`;
+			const collapsed = resolved.enableCollapsibleGroups && (resolved.collapseAllByDefault || this._collapsedKeys.has(key));
+			clone.entries = collapsed ? [] : group.entries.slice();
+			return clone;
+		});
 
 		this._rerenderingEmbed = true;
+		table.display?.();
+		table.updateVirtualDisplay?.();
+		// Patch headers AFTER display() re-creates them, then release the guard
 		requestAnimationFrame(() => {
-			table.display?.();
-			table.updateVirtualDisplay?.();
+			this._patchEmbedHeaders(embedEl);
+			this._patchToolbars();
 			requestAnimationFrame(() => {
-				// Re-apply collapse state so other groups stay collapsed after rerender
-				this._applyEmbedCollapse(embedEl);
-				this._patchEmbedHeaders(embedEl);
 				this._rerenderingEmbed = false;
 			});
 		});
 	}
+
+	private _forceEmbedRerender(embedEl: HTMLElement, _virtualTop: number) {
+		// Legacy stub — logic moved to _applyCollapsedModelToEmbed
+		this._applyCollapsedModelToEmbed(embedEl);
+	}
+
+
 
 	private _reflowEmbed(_embedEl: HTMLElement) {
 		// Virtual positioning is managed by Bases' renderer — we don't touch it.
