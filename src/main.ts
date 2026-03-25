@@ -107,6 +107,11 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 
 
 		this.app.workspace.onLayoutReady(() => {
+			// Clear stale per-element flags from previous plugin loads
+			document.querySelectorAll('.internal-embed.bases-embed').forEach(el => {
+				delete (el as HTMLElement & { __cgbModelApplied?: boolean }).__cgbModelApplied;
+				delete (el as HTMLElement & { __cgbVisibilityWatched?: boolean }).__cgbVisibilityWatched;
+			});
 			this._refreshAllGroupedViews();
 		});
 
@@ -122,6 +127,12 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 					this._refreshAllGroupedViews();
 				} else {
 					this._setInitializingState(false);
+					// Clear per-embed flags so fresh patching runs on this leaf
+					const leaf = this.app.workspace.activeLeaf;
+					leaf?.view?.containerEl?.querySelectorAll('.internal-embed.bases-embed').forEach(el => {
+						delete (el as HTMLElement & { __cgbModelApplied?: boolean }).__cgbModelApplied;
+						delete (el as HTMLElement & { __cgbVisibilityWatched?: boolean }).__cgbVisibilityWatched;
+					});
 					// May be a markdown leaf with embedded bases — patch those
 					this._refreshEmbeddedInActiveLeaf();
 					// May be a canvas leaf with embedded bases — patch those
@@ -438,21 +449,13 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 .cgb-count-badge { font-size: var(--font-ui-smaller); color: var(--text-muted); margin-left: 6px; }
 .bases-view.is-grouped[data-cgb-initializing="true"] { visibility: hidden; }
 .internal-embed .bases-view.is-grouped .bases-table[data-cgb-collapsed="true"] > .bases-tbody { display: none !important; }
-/* Always use natural flow layout for embedded bases (override Bases virtual positioning) */
-.internal-embed .bases-view.is-grouped .bases-table-container { height: auto !important; overflow: visible !important; }
-.internal-embed .bases-view.is-grouped .bases-table { position: relative !important; top: 0 !important; }
+/* Embed: keep virtual positioning on .bases-table so groups are correctly positioned.
+   Container overflow visible. Tbody height auto so rows don't reserve unused space. */
+.internal-embed .bases-view.is-grouped .bases-table-container { overflow: visible !important; }
+.internal-embed .bases-view.is-grouped .bases-tbody { height: auto !important; }
+.internal-embed .bases-view.is-grouped .bases-tbody > .bases-tr { position: static !important; top: auto !important; }
 .canvas-node-content .bases-view.is-grouped .bases-table-container { height: auto !important; }
-.canvas-node-content .bases-view.is-grouped .bases-table { position: relative !important; top: 0 !important; }
 .canvas-node-content .bases-view.is-grouped .bases-table[data-cgb-collapsed="true"] > .bases-tbody { display: none !important; }
-/* For embedded tables, disable virtual positioning and let rows flow naturally */
-.internal-embed .bases-view.is-grouped .bases-tbody {
-  position: static !important;
-  height: auto !important;
-}
-.internal-embed .bases-view.is-grouped .bases-tbody > .bases-tr {
-  position: static !important;
-  top: auto !important;
-}
 `;
 		document.head.appendChild(this._styleEl);
 	}
@@ -969,26 +972,81 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 			return clone;
 		});
 
+		// Install a guard that re-applies the collapsed cache before every updateVirtualDisplay
+		this._installEmbedUpdateGuard(embedEl, table);
+
 		this._rerenderingEmbed = true;
+		// Set the cache directly before display() so even the first render is correct
+		table.data.groupedDataCache = table.__cgbOriginalGroupedData!.map(group => {
+			const clone = { ...group } as BasesGroup;
+			const groupValue = this._normalizeGroupValue(this._groupValue(group));
+			const key = `${src}::${groupValue}`;
+			const collapsed = resolved.enableCollapsibleGroups && (resolved.collapseAllByDefault || this._collapsedKeys.has(key));
+			clone.entries = collapsed ? [] : group.entries.slice();
+			return clone;
+		});
 		table.display?.();
 		table.updateVirtualDisplay?.();
 
-		// Patch headers after display() re-creates them
+		// Patch headers after display() re-creates them, fix container height
 		requestAnimationFrame(() => {
 			this._patchEmbedHeaders(embedEl);
 			this._patchToolbars();
+			this._fixEmbedContainerHeight(embedEl, table);
 			requestAnimationFrame(() => {
 				this._rerenderingEmbed = false;
-				// Second-pass render: by now the embed has real layout dimensions, so
-				// updateVirtualDisplay will correctly compute which rows are in-viewport.
-				// With position:static CSS these rows take up real space — no whitespace.
-				requestAnimationFrame(() => {
-					if (!this._rerenderingEmbed) {
-						table.updateVirtualDisplay?.();
-					}
-				});
 			});
 		});
+	}
+
+	private _installEmbedUpdateGuard(embedEl: HTMLElement, table: BasesTableView) {
+		// Guard: if Bases' internal observer resets groupedDataCache and calls
+		// updateVirtualDisplay, our collapsed state gets lost. Wrap updateVirtualDisplay
+		// to always re-apply the collapsed model before running.
+		// Always reinstall — stale wrappers from previous builds need replacing
+		(table as BasesTableView & { __cgbUpdateGuard?: boolean }).__cgbUpdateGuard = true;
+
+		// Get the prototype's original function, bypassing any stale instance wrappers
+		const origUpdate = Object.getPrototypeOf(table).updateVirtualDisplay!.bind(table);
+		const self = this;
+		table.updateVirtualDisplay = function(this: BasesTableView) {
+			if (!self._rerenderingEmbed) {
+				// Re-apply collapsed cache so virtual renderer uses correct entry counts
+				const src = embedEl.getAttribute('src') ?? '';
+				const resolved = self._getResolvedSettings();
+				if (this.data && this.__cgbOriginalGroupedData) {
+					this.data.groupedDataCache = this.__cgbOriginalGroupedData.map(group => {
+						const clone = { ...group } as BasesGroup;
+						const groupValue = self._normalizeGroupValue(self._groupValue(group));
+						const key = `${src}::${groupValue}`;
+						const collapsed = resolved.enableCollapsibleGroups && (resolved.collapseAllByDefault || self._collapsedKeys.has(key));
+						clone.entries = collapsed ? [] : group.entries.slice();
+						return clone;
+					});
+				}
+			}
+			return origUpdate();
+		};
+	}
+
+	private _fixEmbedContainerHeight(embedEl: HTMLElement, table: BasesTableView) {
+		// The .bases-table-container uses position:absolute children (virtual scroll).
+		// After rendering, compute the total content height from each group's top + height,
+		// and set the container height so the embed grows to fit all content.
+		const container = table.containerEl as HTMLElement | undefined;
+		if (!container) return;
+		const tables = container.querySelectorAll<HTMLElement>(':scope > .bases-table');
+		if (!tables.length) return;
+		let maxBottom = 0;
+		for (const t of Array.from(tables)) {
+			const top = parseFloat(t.style.top) || 0;
+			const header = t.querySelector<HTMLElement>(':scope > .bases-group-heading');
+			const tbody = t.querySelector<HTMLElement>(':scope > .bases-tbody');
+			const headerH = header?.offsetHeight ?? 40;
+			const bodyH = tbody ? tbody.offsetHeight : 0;
+			maxBottom = Math.max(maxBottom, top + headerH + bodyH);
+		}
+		if (maxBottom > 0) container.style.height = `${maxBottom}px`;
 	}
 
 	private _watchEmbedVisibility(embedEl: HTMLElement) {
@@ -1015,7 +1073,11 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 			for (const entry of entries) {
 				if (!entry.isIntersecting) continue;
 				// A group table scrolled into view — render its rows and sync chevrons
-				getTable()?.updateVirtualDisplay?.();
+				const t = getTable();
+				if (t) {
+					t.updateVirtualDisplay?.();
+					this._fixEmbedContainerHeight(embedEl, t);
+				}
 				this._patchEmbedHeaders(embedEl);
 				break; // one call is enough per batch
 			}
