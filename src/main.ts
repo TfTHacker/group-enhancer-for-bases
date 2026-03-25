@@ -60,7 +60,7 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 	private _rerenderingEmbed: boolean = false;
 	private _styleEl: HTMLStyleElement | null = null;
 	private _boundPointerUp?: (e: PointerEvent) => void;
-	private _patchedHeaders: WeakSet<HTMLElement> = new WeakSet();
+	private _patchedHeaders: Set<HTMLElement> = new Set();
 	private _lastHeaderCount: number = 0;
 	private _headerKeyCache: Map<HTMLElement, string> = new Map();
 
@@ -1562,7 +1562,7 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 		await this.saveData(data);
 		// Mark cache as dirty since global settings changed
 		this._baseConfigCacheDirty = true;
-		// If collapsible groups disabled, remove all chevrons, patched markers, and collapse state
+		// If collapsible groups disabled, clean up all plugin DOM state
 		if (!this.settings.enableCollapsibleGroups) {
 			document.querySelectorAll('.cgb-chevron').forEach(el => el.remove());
 			document.querySelectorAll('[data-cgb-patched]').forEach(el => {
@@ -1575,6 +1575,36 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 				const tbody = el.querySelector<HTMLElement>(':scope > .bases-tbody');
 				if (tbody) tbody.style.height = '';
 			});
+			// Remove update guard from all embed tables so cache is no longer intercepted
+			document.querySelectorAll<HTMLElement>('.internal-embed.bases-embed').forEach(embedEl => {
+				const widget = (embedEl as unknown as { cmView?: { widget?: { child?: { controller?: { _children?: unknown[] } } } } })?.cmView?.widget;
+				const children = widget?.child?.controller?._children;
+				if (!Array.isArray(children)) return;
+				const table = children.find((c: unknown) => {
+					const m = c as BasesTableView;
+					return typeof m?.display === 'function' && Array.isArray(m?.groups);
+				}) as BasesTableView | undefined;
+				if (!table) return;
+				// Restore prototype's updateVirtualDisplay (remove instance override)
+				if (Object.prototype.hasOwnProperty.call(table, 'updateVirtualDisplay')) {
+					delete (table as BasesTableView & { updateVirtualDisplay?: unknown }).updateVirtualDisplay;
+				}
+				delete (table as BasesTableView & { __cgbUpdateGuard?: boolean }).__cgbUpdateGuard;
+				delete table.__cgbOriginalGroupedData;
+				// Restore full cache
+				if (table.data?.groupedDataCache && table.__cgbGroupCountMap) {
+					table.data.groupedDataCache = null;
+				}
+				table.display?.();
+				table.updateVirtualDisplay?.();
+			});
+			// Also reset active table view
+			const activeTable = this._getActiveTableView();
+			if (activeTable) {
+				this._resetGroupedDataCache();
+				activeTable.display?.();
+				activeTable.updateVirtualDisplay?.();
+			}
 			this._patchedHeaders.clear();
 			this._headerKeyCache.clear();
 		}
