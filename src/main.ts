@@ -188,6 +188,9 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 		const container = leaf.view?.containerEl as HTMLElement | undefined;
 		if (!container) return;
 		const embedEls = container.querySelectorAll<HTMLElement>('.internal-embed.bases-embed');
+		if (!embedEls.length) return;
+		// Patch toolbars for all grouped views in document (covers embeds too)
+		this._patchToolbars();
 		embedEls.forEach(embedEl => {
 			this._patchEmbedHeaders(embedEl);
 			this._applyEmbedCollapse(embedEl);
@@ -306,6 +309,9 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 .cgb-count-badge { font-size: var(--font-ui-smaller); color: var(--text-muted); margin-left: 6px; }
 .bases-view.is-grouped[data-cgb-initializing="true"] { visibility: hidden; }
 .internal-embed .bases-view.is-grouped .bases-table[data-cgb-collapsed="true"] > .bases-tbody { display: none !important; }
+/* When all groups are collapsed, reset virtual positioning so headers stack compactly */
+.internal-embed .bases-view.is-grouped[data-cgb-all-collapsed="true"] .bases-table-container { height: auto !important; overflow: visible !important; }
+.internal-embed .bases-view.is-grouped[data-cgb-all-collapsed="true"] .bases-table { position: relative !important; top: 0 !important; }
 .canvas-node-content .bases-view.is-grouped .bases-table-container { height: auto !important; }
 .canvas-node-content .bases-view.is-grouped .bases-table { position: relative !important; top: auto !important; }
 `;
@@ -664,15 +670,17 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 
 	private _applyEmbedCollapse(embedEl: HTMLElement) {
 		const resolved = this._getResolvedSettings();
-		const container = embedEl.querySelector('.bases-view.is-grouped');
+		const container = embedEl.querySelector<HTMLElement>('.bases-view.is-grouped');
 		if (!container) return;
 		const src = embedEl.getAttribute('src') ?? '';
 		const headers = container.querySelectorAll<HTMLElement>('.bases-group-heading');
+		let allCollapsed = headers.length > 0;
 		for (let i = 0; i < headers.length; i++) {
 			const h = headers[i];
 			const groupValue = this._normalizeGroupValue(h.querySelector('.bases-group-value')?.textContent?.trim());
 			const k = `${src}::${groupValue}`;
 			const collapsed = resolved.enableCollapsibleGroups && (resolved.collapseAllByDefault || this._collapsedKeys.has(k));
+			if (!collapsed) allCollapsed = false;
 			const tableEl = h.closest('.bases-table') as HTMLElement | null;
 			if (tableEl) {
 				// Use data attribute so CSS !important rule survives virtual renderer re-renders
@@ -681,8 +689,10 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 			}
 			this._syncHeaderUi(h);
 		}
-		// Clear virtual scroll positioning so CSS height:auto/position:relative take over
-		this._reflowEmbed(embedEl);
+		// When all groups are collapsed, override virtual positioning so headers stack compactly.
+		// When any group is expanded, remove override so Bases' virtual renderer can render rows.
+		if (allCollapsed) container.setAttribute('data-cgb-all-collapsed', 'true');
+		else container.removeAttribute('data-cgb-all-collapsed');
 	}
 
 	private _applyCanvasNodeCollapse(canvasNodeEl: HTMLElement) {
