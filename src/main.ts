@@ -126,12 +126,49 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 					this._refreshEmbeddedInActiveLeaf();
 					// May be a canvas leaf with embedded bases — patch those
 					this._refreshCanvasLeaf();
+					// Set up scroll listener to catch embeds created by CM virtualization
+					this._setupScrollPatch();
 				}
 			}, 120);
 		});
 
 		// Watch for embedded bases appearing in the DOM
 		this._setupEmbedObserver();
+	}
+
+	private _scrollPatchHandler: (() => void) | null = null;
+	private _scrollPatchScroller: HTMLElement | null = null;
+
+	private _setupScrollPatch() {
+		// Remove previous scroll listener if any
+		if (this._scrollPatchHandler && this._scrollPatchScroller) {
+			this._scrollPatchScroller.removeEventListener('scroll', this._scrollPatchHandler);
+			this._scrollPatchHandler = null;
+			this._scrollPatchScroller = null;
+		}
+
+		const leaf = this.app.workspace.activeLeaf;
+		if (!leaf) return;
+		if (leaf.view?.getViewType() !== 'markdown') return;
+
+		const scroller = leaf.view.containerEl?.querySelector<HTMLElement>('.cm-scroller');
+		if (!scroller) return;
+
+		let ticking = false;
+		const handler = () => {
+			if (ticking) return;
+			ticking = true;
+			requestAnimationFrame(() => {
+				ticking = false;
+				// Check for unpatched embeds that CM virtualization may have just created.
+				// Delay slightly to let Bases finish its own initialization after CM renders.
+				setTimeout(() => this._refreshEmbeddedInActiveLeaf(), 200);
+			});
+		};
+
+		scroller.addEventListener('scroll', handler, { passive: true });
+		this._scrollPatchHandler = handler;
+		this._scrollPatchScroller = scroller;
 	}
 
 	private _setupEmbedObserver() {
@@ -153,8 +190,13 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 					if (node.nodeType !== 1) continue;
 					const el = node as HTMLElement;
 					if (el.classList?.contains('bases-view') ||
-						el.querySelector?.('.bases-view.is-grouped')) {
-						el.closest?.('.internal-embed') ? hasNewEmbed = true : hasNewGroupedView = true;
+						el.classList?.contains('bases-embed') ||
+						el.classList?.contains('internal-embed') ||
+						el.querySelector?.('.bases-view.is-grouped') ||
+						el.querySelector?.('.bases-embed') ||
+						el.querySelector?.('.internal-embed.bases-embed')) {
+						const isEmbed = el.closest?.('.internal-embed') || el.classList?.contains('bases-embed') || el.classList?.contains('internal-embed') || !!el.querySelector?.('.internal-embed');
+						isEmbed ? hasNewEmbed = true : hasNewGroupedView = true;
 					}
 					// Unpatched group headings added — patch them immediately
 					if (el.classList?.contains('bases-group-heading') && !el.hasAttribute('data-cgb-patched')) {
@@ -221,10 +263,10 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 			this._applyEmbedCollapse(embedEl);
 			// Watch for embed scrolling into view so Bases can render all rows
 			this._watchEmbedVisibility(embedEl);
-			// Only apply data model on initial load (not during observer-triggered refreshes)
-			// _applyCollapsedModelToEmbed calls display() which would cause a loop
-			if (!embedEl.querySelector('.bases-group-heading[data-cgb-patched]')) {
-				// First time patching this embed — apply the data model
+			// Apply data model on first load only (when headers haven't been patched yet).
+			// Re-entry is handled by _rerenderingEmbed guard.
+			const isFirstLoad = !embedEl.querySelector('.bases-group-heading[data-cgb-patched]');
+			if (isFirstLoad && !this._rerenderingEmbed) {
 				this._applyCollapsedModelToEmbed(embedEl);
 			}
 		});
@@ -341,6 +383,9 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 		this._embedObserver?.disconnect();
 		this._embedVisibilityObservers.forEach(io => io.disconnect());
 		this._embedVisibilityObservers = [];
+		if (this._scrollPatchHandler && this._scrollPatchScroller) {
+			this._scrollPatchScroller.removeEventListener('scroll', this._scrollPatchHandler);
+		}
 		if (this._patchTimer) clearTimeout(this._patchTimer);
 		if (this._refreshTimer) clearTimeout(this._refreshTimer);
 		if (this._boundPointerUp) document.removeEventListener('pointerup', this._boundPointerUp, true);
@@ -921,12 +966,21 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 		table.display?.();
 		table.updateVirtualDisplay?.();
 
-		// With position:static CSS (see _injectStyles), rows rendered by updateVirtualDisplay
-		// take up real space — no whitespace gaps. Remaining rows load as the user scrolls.
+		// Patch headers after display() re-creates them
 		requestAnimationFrame(() => {
 			this._patchEmbedHeaders(embedEl);
 			this._patchToolbars();
-			requestAnimationFrame(() => { this._rerenderingEmbed = false; });
+			requestAnimationFrame(() => {
+				this._rerenderingEmbed = false;
+				// Second-pass render: by now the embed has real layout dimensions, so
+				// updateVirtualDisplay will correctly compute which rows are in-viewport.
+				// With position:static CSS these rows take up real space — no whitespace.
+				requestAnimationFrame(() => {
+					if (!this._rerenderingEmbed) {
+						table.updateVirtualDisplay?.();
+					}
+				});
+			});
 		});
 	}
 
