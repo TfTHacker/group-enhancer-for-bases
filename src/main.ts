@@ -392,6 +392,15 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 .canvas-node-content .bases-view.is-grouped .bases-table-container { height: auto !important; }
 .canvas-node-content .bases-view.is-grouped .bases-table { position: relative !important; top: 0 !important; }
 .canvas-node-content .bases-view.is-grouped .bases-table[data-cgb-collapsed="true"] > .bases-tbody { display: none !important; }
+/* For embedded tables, disable virtual positioning and let rows flow naturally */
+.internal-embed .bases-view.is-grouped .bases-tbody {
+  position: static !important;
+  height: auto !important;
+}
+.internal-embed .bases-view.is-grouped .bases-tbody > .bases-tr {
+  position: static !important;
+  top: auto !important;
+}
 `;
 		document.head.appendChild(this._styleEl);
 	}
