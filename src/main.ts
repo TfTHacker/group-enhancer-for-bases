@@ -783,25 +783,33 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 		this._applyCollapsedModelToCanvasNode(canvasNodeEl);
 	}
 
+	private _getCanvasTableView(canvasNodeEl: HTMLElement): BasesTableView | undefined {
+		// Find the Bases table view by walking canvas nodes for the one whose nodeEl matches
+		const leaves = this.app.workspace.getLeavesOfType('canvas');
+		for (const leaf of leaves) {
+			const canvas = (leaf.view as unknown as { canvas?: { nodes?: Map<string, { nodeEl?: HTMLElement; child?: { controller?: { _children?: unknown[] } } }> } })?.canvas;
+			if (!canvas?.nodes) continue;
+			let found: BasesTableView | undefined;
+			canvas.nodes.forEach((node) => {
+				if (found) return;
+				if (node.nodeEl !== canvasNodeEl) return;
+				const children = node.child?.controller?._children;
+				if (!Array.isArray(children)) return;
+				found = children.find((c: unknown) => {
+					const m = c as BasesTableView;
+					return typeof m?.display === 'function' && Array.isArray(m?.groups) && !!m?.scrollEl;
+				}) as BasesTableView | undefined;
+			});
+			if (found) return found;
+		}
+		return undefined;
+	}
+
 	private _applyCollapsedModelToCanvasNode(canvasNodeEl: HTMLElement) {
 		const resolved = this._getResolvedSettings();
 		const filePath = this._filePathForCanvasNode(canvasNodeEl) ?? '';
-		// Find the Bases table view inside the canvas node
-		const widget = (canvasNodeEl as unknown as { child?: { controller?: { _children?: unknown[] } } })?.child?.controller?._children;
-		// Canvas nodes expose the child differently — find it via the embed element
-		const embedEl = canvasNodeEl.querySelector<HTMLElement>('.bases-view.is-grouped');
-		if (!embedEl) return;
 
-		// Walk up to find the Bases controller via the canvas node's child
-		const canvasNode = (canvasNodeEl as unknown as { child?: unknown })?.child;
-		const controller = (canvasNode as unknown as { controller?: { _children?: unknown[] } })?.controller;
-		const children = controller?._children;
-		if (!Array.isArray(children)) return;
-
-		const table = children.find((c: unknown) => {
-			const m = c as BasesTableView;
-			return typeof m?.display === 'function' && Array.isArray(m?.groups) && !!m?.scrollEl;
-		}) as BasesTableView | undefined;
+		const table = this._getCanvasTableView(canvasNodeEl);
 		if (!table?.data) return;
 
 		if (!table.__cgbOriginalGroupedData) {
