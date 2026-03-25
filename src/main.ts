@@ -1000,25 +1000,39 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 		// Bases' virtual renderer only renders rows visible in the window viewport.
 		// If the embed starts below the viewport (common for long notes), rows won't render
 		// until the embed is actually visible on screen.
+		const getTable = () => {
+			const widget = (embedEl as unknown as { cmView?: { widget?: { child?: { controller?: { _children?: unknown[] } } } } })?.cmView?.widget;
+			const children = widget?.child?.controller?._children;
+			if (!Array.isArray(children)) return undefined;
+			return children.find((c: unknown) => {
+				const m = c as BasesTableView;
+				return typeof m?.display === 'function' && Array.isArray(m?.groups) && !!m?.scrollEl;
+			}) as BasesTableView | undefined;
+		};
+
 		const io = new IntersectionObserver((entries) => {
+			if (this._rerenderingEmbed) return;
 			for (const entry of entries) {
 				if (!entry.isIntersecting) continue;
-				if (this._rerenderingEmbed) continue;
-				// Trigger updateVirtualDisplay so Bases renders rows now that the embed is visible.
-				const widget = (embedEl as unknown as { cmView?: { widget?: { child?: { controller?: { _children?: unknown[] } } } } })?.cmView?.widget;
-				const children = widget?.child?.controller?._children;
-				if (!Array.isArray(children)) continue;
-				const table = children.find((c: unknown) => {
-					const m = c as BasesTableView;
-					return typeof m?.display === 'function' && Array.isArray(m?.groups) && !!m?.scrollEl;
-				}) as BasesTableView | undefined;
-				table?.updateVirtualDisplay?.();
+				// A group table scrolled into view — render its rows and sync chevrons
+				getTable()?.updateVirtualDisplay?.();
+				this._patchEmbedHeaders(embedEl);
+				break; // one call is enough per batch
 			}
 		}, { threshold: 0.01 });
+		// Observe the embed container AND all individual group tables so rows render
+		// when any group scrolls into view (including after expanding a group)
 		io.observe(embedEl);
+		embedEl.querySelectorAll<HTMLElement>('.bases-table').forEach(t => io.observe(t));
 
-		// Clean up on plugin unload
+		// Re-observe when new tables are added (e.g. after display() call)
+		const tableObserver = new MutationObserver(() => {
+			embedEl.querySelectorAll<HTMLElement>('.bases-table').forEach(t => io.observe(t));
+		});
+		tableObserver.observe(embedEl, { childList: true, subtree: true });
 		this._embedVisibilityObservers.push(io);
+		// Store tableObserver as a fake IntersectionObserver (has disconnect)
+		this._embedVisibilityObservers.push({ disconnect: () => tableObserver.disconnect() } as unknown as IntersectionObserver);
 	}
 
 
