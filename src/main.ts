@@ -1633,7 +1633,10 @@ class CgbSettingTab extends PluginSettingTab {
 				toggle.setValue(this.plugin.settings.enableCollapsibleGroups).onChange(async value => {
 					this.plugin.settings.enableCollapsibleGroups = value;
 					await this.plugin.saveSettings();
-					(this.plugin as unknown as { _refreshAllGroupedViews: () => void })._refreshAllGroupedViews();
+					if (value) {
+						(this.plugin as unknown as { _refreshAllGroupedViews: () => void })._refreshAllGroupedViews();
+					}
+					// When disabling: saveSettings already removed chevrons; don't re-patch
 				}),
 			);
 
