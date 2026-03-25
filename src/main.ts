@@ -933,41 +933,29 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 	}
 
 	private _populateAllEmbedRows(table: BasesTableView, embedEl: HTMLElement) {
-		// With position:static CSS on tbody rows, rows added by updateVirtualDisplay stay in
-		// the DOM — they're never removed because there's no virtual position to cull by.
-		// We just need to call updateVirtualDisplay at each "scroll position" to ensure all
-		// rows get added. We do this by temporarily scrolling the page scroller.
+		// With position:static CSS, rows added by updateVirtualDisplay accumulate in the DOM.
+		// We call updateVirtualDisplay at each scroll position to ensure all rows get added.
+		// All calls happen synchronously so the browser never repaints between steps — no flicker.
 		const scroller = embedEl.closest('.cm-scroller') as HTMLElement | null;
-		if (!scroller) {
-			// Fallback: patch headers and release guard
-			requestAnimationFrame(() => {
-				this._patchEmbedHeaders(embedEl);
-				this._patchToolbars();
-				requestAnimationFrame(() => { this._rerenderingEmbed = false; });
-			});
-			return;
-		}
 
-		const origScrollTop = scroller.scrollTop;
-		const scrollHeight = scroller.scrollHeight;
-		const step = 400; // px per step
-		let pos = 0;
-
-		const tick = () => {
-			if (pos <= scrollHeight) {
+		if (scroller) {
+			const origScrollTop = scroller.scrollTop;
+			const scrollHeight = scroller.scrollHeight;
+			const step = 300;
+			// Synchronous loop — no rAF between steps, browser won't repaint
+			for (let pos = 0; pos <= scrollHeight; pos += step) {
 				scroller.scrollTop = pos;
 				table.updateVirtualDisplay?.();
-				pos += step;
-				requestAnimationFrame(tick);
-			} else {
-				// Restore scroll position
-				scroller.scrollTop = origScrollTop;
-				this._patchEmbedHeaders(embedEl);
-				this._patchToolbars();
-				requestAnimationFrame(() => { this._rerenderingEmbed = false; });
 			}
-		};
-		requestAnimationFrame(tick);
+			scroller.scrollTop = origScrollTop;
+		}
+
+		// Patch headers and release guard after paint
+		requestAnimationFrame(() => {
+			this._patchEmbedHeaders(embedEl);
+			this._patchToolbars();
+			requestAnimationFrame(() => { this._rerenderingEmbed = false; });
+		});
 	}
 
 	private _watchEmbedVisibility(embedEl: HTMLElement) {
