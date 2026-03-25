@@ -54,6 +54,7 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 	private _collapsedKeys: Set<string> = new Set();
 	private _observer: MutationObserver | null = null;
 	private _embedObserver: MutationObserver | null = null;
+	private _embedVisibilityObservers: IntersectionObserver[] = [];
 	private _patchTimer: ReturnType<typeof setTimeout> | null = null;
 	private _refreshTimer: ReturnType<typeof setTimeout> | null = null;
 	private _rerenderingEmbed: boolean = false;
@@ -218,6 +219,8 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 		embedEls.forEach(embedEl => {
 			this._patchEmbedHeaders(embedEl);
 			this._applyEmbedCollapse(embedEl);
+			// Watch for embed scrolling into view so Bases can render all rows
+			this._watchEmbedVisibility(embedEl);
 			// Only apply data model on initial load (not during observer-triggered refreshes)
 			// _applyCollapsedModelToEmbed calls display() which would cause a loop
 			if (!embedEl.querySelector('.bases-group-heading[data-cgb-patched]')) {
@@ -336,6 +339,8 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 	onunload() {
 		this._observer?.disconnect();
 		this._embedObserver?.disconnect();
+		this._embedVisibilityObservers.forEach(io => io.disconnect());
+		this._embedVisibilityObservers = [];
 		if (this._patchTimer) clearTimeout(this._patchTimer);
 		if (this._refreshTimer) clearTimeout(this._refreshTimer);
 		if (this._boundPointerUp) document.removeEventListener('pointerup', this._boundPointerUp, true);
@@ -903,18 +908,14 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 			return clone;
 		});
 
-		// Force lastViewport to a huge rect so Bases renders ALL rows as in-view.
-		// updateVirtualDisplay uses table.lastViewport to decide which rows to show —
-		// on initial embed load it may be stale/narrow, causing rows to not render.
-		const savedViewport = (table as BasesTableView & { lastViewport?: unknown }).lastViewport;
-		(table as BasesTableView & { lastViewport?: unknown }).lastViewport = { left: -99999, right: 99999, top: -99999, bottom: 99999 };
+		// For embedded tables, permanently patch updateVirtualDisplay to always use a huge
+		// viewport. Without this, Bases' virtual renderer removes rows that are "off-screen"
+		// relative to the actual small embed rect — creating whitespace on expand/reload.
+		this._patchEmbedTableVirtualDisplay(table);
 
 		this._rerenderingEmbed = true;
 		table.display?.();
 		table.updateVirtualDisplay?.();
-
-		// Restore lastViewport
-		(table as BasesTableView & { lastViewport?: unknown }).lastViewport = savedViewport;
 
 		// Patch headers AFTER display() re-creates them, then release the guard
 		requestAnimationFrame(() => {
@@ -924,6 +925,41 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 				this._rerenderingEmbed = false;
 			});
 		});
+	}
+
+	private _watchEmbedVisibility(embedEl: HTMLElement) {
+		// Already watching — skip
+		if ((embedEl as HTMLElement & { __cgbVisibilityWatched?: boolean }).__cgbVisibilityWatched) return;
+		(embedEl as HTMLElement & { __cgbVisibilityWatched?: boolean }).__cgbVisibilityWatched = true;
+
+		// When the embed scrolls into view, trigger updateVirtualDisplay on the Bases table.
+		// Bases' virtual renderer only renders rows visible in the window viewport.
+		// If the embed starts below the viewport (common for long notes), rows won't render
+		// until the embed is actually visible on screen.
+		const io = new IntersectionObserver((entries) => {
+			for (const entry of entries) {
+				if (!entry.isIntersecting) continue;
+				const widget = (embedEl as unknown as { cmView?: { widget?: { child?: { controller?: { _children?: unknown[] } } } } })?.cmView?.widget;
+				const children = widget?.child?.controller?._children;
+				if (!Array.isArray(children)) continue;
+				const table = children.find((c: unknown) => {
+					const m = c as BasesTableView;
+					return typeof m?.display === 'function' && Array.isArray(m?.groups) && !!m?.scrollEl;
+				}) as BasesTableView | undefined;
+				if (table?.updateVirtualDisplay && !this._rerenderingEmbed) {
+					table.updateVirtualDisplay();
+				}
+			}
+		}, { threshold: 0.01 });
+		io.observe(embedEl);
+
+		// Clean up on plugin unload
+		this._embedVisibilityObservers.push(io);
+	}
+
+	// Also keep a method to patch the virtual display table for use in _applyCollapsedModelToEmbed
+	private _patchEmbedTableVirtualDisplay(_table: BasesTableView) {
+		// No-op: visibility-based update handles this now
 	}
 
 	private _forceEmbedRerender(embedEl: HTMLElement, _virtualTop: number) {
