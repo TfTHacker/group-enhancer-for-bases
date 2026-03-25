@@ -123,6 +123,8 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 					this._setInitializingState(false);
 					// May be a markdown leaf with embedded bases — patch those
 					this._refreshEmbeddedInActiveLeaf();
+					// May be a canvas leaf with embedded bases — patch those
+					this._refreshCanvasLeaf();
 				}
 			}, 120);
 		});
@@ -166,6 +168,10 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 				this._refreshTimer = setTimeout(() => {
 					if (this._getActiveTableView()) {
 						this._refreshAllGroupedViews();
+					} else {
+						// Canvas or other view with embedded grouped bases
+						this._patchToolbars();
+						this._patchHeaders();
 					}
 				}, 100);
 			}
@@ -182,6 +188,14 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 			attributes: true,
 			attributeFilter: ['class'],
 		});
+	}
+
+	private _refreshCanvasLeaf() {
+		const leaf = this.app.workspace.activeLeaf;
+		if (!leaf) return;
+		if (leaf.view?.getViewType() !== 'canvas') return;
+		this._patchToolbars();
+		this._patchHeaders();
 	}
 
 	private _refreshEmbeddedInActiveLeaf() {
