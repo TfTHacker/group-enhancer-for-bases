@@ -378,7 +378,8 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 .internal-embed .bases-view.is-grouped .bases-table-container { height: auto !important; overflow: visible !important; }
 .internal-embed .bases-view.is-grouped .bases-table { position: relative !important; top: 0 !important; }
 .canvas-node-content .bases-view.is-grouped .bases-table-container { height: auto !important; }
-.canvas-node-content .bases-view.is-grouped .bases-table { position: relative !important; top: auto !important; }
+.canvas-node-content .bases-view.is-grouped .bases-table { position: relative !important; top: 0 !important; }
+.canvas-node-content .bases-view.is-grouped .bases-table[data-cgb-collapsed="true"] > .bases-tbody { display: none !important; }
 `;
 		document.head.appendChild(this._styleEl);
 	}
@@ -773,11 +774,64 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 			const k = filePath ? `${filePath}::${groupValue}` : this._stateKey(groupValue);
 			const collapsed = resolved.enableCollapsibleGroups && (resolved.collapseAllByDefault || this._collapsedKeys.has(k));
 			const tableEl = h.closest('.bases-table') as HTMLElement | null;
-			const tbody = tableEl?.querySelector<HTMLElement>(':scope > .bases-tbody');
-			if (tbody) tbody.style.display = collapsed ? 'none' : '';
+			if (tableEl) {
+				if (collapsed) tableEl.setAttribute('data-cgb-collapsed', 'true');
+				else tableEl.removeAttribute('data-cgb-collapsed');
+			}
 			this._syncHeaderUi(h);
 		}
-		this._reflowCanvasNode(canvasNodeEl);
+		this._applyCollapsedModelToCanvasNode(canvasNodeEl);
+	}
+
+	private _applyCollapsedModelToCanvasNode(canvasNodeEl: HTMLElement) {
+		const resolved = this._getResolvedSettings();
+		const filePath = this._filePathForCanvasNode(canvasNodeEl) ?? '';
+		// Find the Bases table view inside the canvas node
+		const widget = (canvasNodeEl as unknown as { child?: { controller?: { _children?: unknown[] } } })?.child?.controller?._children;
+		// Canvas nodes expose the child differently — find it via the embed element
+		const embedEl = canvasNodeEl.querySelector<HTMLElement>('.bases-view.is-grouped');
+		if (!embedEl) return;
+
+		// Walk up to find the Bases controller via the canvas node's child
+		const canvasNode = (canvasNodeEl as unknown as { child?: unknown })?.child;
+		const controller = (canvasNode as unknown as { controller?: { _children?: unknown[] } })?.controller;
+		const children = controller?._children;
+		if (!Array.isArray(children)) return;
+
+		const table = children.find((c: unknown) => {
+			const m = c as BasesTableView;
+			return typeof m?.display === 'function' && Array.isArray(m?.groups) && !!m?.scrollEl;
+		}) as BasesTableView | undefined;
+		if (!table?.data) return;
+
+		if (!table.__cgbOriginalGroupedData) {
+			const previousCache = table.data.groupedDataCache;
+			table.data.groupedDataCache = null;
+			table.__cgbOriginalGroupedData = (table.data.groupedData ?? []).map(group => ({
+				...group, entries: group.entries.slice(),
+			} as BasesGroup));
+			table.data.groupedDataCache = previousCache ?? null;
+		}
+
+		table.data.groupedDataCache = table.__cgbOriginalGroupedData.map(group => {
+			const clone = { ...group } as BasesGroup;
+			const groupValue = this._normalizeGroupValue(this._groupValue(group));
+			const key = filePath ? `${filePath}::${groupValue}` : this._stateKey(groupValue);
+			const collapsed = resolved.enableCollapsibleGroups && (resolved.collapseAllByDefault || this._collapsedKeys.has(key));
+			clone.entries = collapsed ? [] : group.entries.slice();
+			return clone;
+		});
+
+		table.display?.();
+		table.updateVirtualDisplay?.();
+		this._fixGroupGaps(table);
+		this._installGapFixer(table);
+
+		// Re-patch headers after display() re-creates them
+		requestAnimationFrame(() => {
+			this._patchHeaders();
+			this._patchToolbars();
+		});
 	}
 
 	private _reflowCanvasNode(canvasNodeEl: HTMLElement) {
