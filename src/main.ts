@@ -53,6 +53,7 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 	private _embedObserver: MutationObserver | null = null;
 	private _patchTimer: ReturnType<typeof setTimeout> | null = null;
 	private _refreshTimer: ReturnType<typeof setTimeout> | null = null;
+	private _rerenderingEmbed: boolean = false;
 	private _styleEl: HTMLStyleElement | null = null;
 	private _boundPointerUp?: (e: PointerEvent) => void;
 	private _patchedHeaders: WeakSet<HTMLElement> = new WeakSet();
@@ -181,6 +182,7 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 	}
 
 	private _refreshEmbeddedInActiveLeaf() {
+		if (this._rerenderingEmbed) return;
 		const leaf = this.app.workspace.activeLeaf;
 		if (!leaf) return;
 		const container = leaf.view?.containerEl as HTMLElement | undefined;
@@ -190,13 +192,6 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 			this._patchEmbedHeaders(embedEl);
 			this._applyEmbedCollapse(embedEl);
 		});
-		// Re-apply reflow after Bases' own renderer may have re-set positioning
-		setTimeout(() => {
-			embedEls.forEach(embedEl => this._reflowEmbed(embedEl));
-		}, 100);
-		setTimeout(() => {
-			embedEls.forEach(embedEl => this._reflowEmbed(embedEl));
-		}, 400);
 	}
 
 	private _patchEmbedHeaders(embedEl: HTMLElement) {
@@ -310,8 +305,6 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 .cgb-toolbar-btn.is-icon-only { padding: 4px 6px; gap: 0; }
 .cgb-count-badge { font-size: var(--font-ui-smaller); color: var(--text-muted); margin-left: 6px; }
 .bases-view.is-grouped[data-cgb-initializing="true"] { visibility: hidden; }
-.internal-embed .bases-view.is-grouped .bases-table-container { height: auto !important; overflow: visible !important; }
-.internal-embed .bases-view.is-grouped .bases-table { position: relative !important; top: 0 !important; width: 100% !important; }
 .internal-embed .bases-view.is-grouped .bases-table[data-cgb-collapsed="true"] > .bases-tbody { display: none !important; }
 .canvas-node-content .bases-view.is-grouped .bases-table-container { height: auto !important; }
 .canvas-node-content .bases-view.is-grouped .bases-table { position: relative !important; top: auto !important; }
@@ -652,6 +645,10 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 		if (embedEl) {
 			this._applyEmbedCollapse(embedEl);
 			this._syncHeaderUi(header);
+			// If we just expanded a group, force the embedded table to re-render rows
+			if (wasCollapsed) {
+				this._forceEmbedRerender(embedEl);
+			}
 			return;
 		}
 
@@ -726,18 +723,33 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 		tableContainer.style.height = `${top}px`;
 	}
 
-	private _reflowEmbed(embedEl: HTMLElement) {
-		// For embeds, clear virtual scroll positioning and let CSS flow naturally.
-		// offsetHeight returns 0 for elements in CM widgets, so measurement-based
-		// reflow doesn't work. The CSS overrides (height:auto, position:relative)
-		// handle the layout instead.
-		const tableContainer = embedEl.querySelector<HTMLElement>('.bases-table-container');
-		if (!tableContainer) return;
-		tableContainer.style.height = '';
-		const tables = tableContainer.querySelectorAll<HTMLElement>(':scope > .bases-table');
-		for (let i = 0; i < tables.length; i++) {
-			tables[i].style.top = '';
-		}
+	private _forceEmbedRerender(embedEl: HTMLElement) {
+		// After expanding a group, force Bases to re-render rows into the now-visible tbody.
+		const widget = (embedEl as unknown as { cmView?: { widget?: { child?: { controller?: { _children?: unknown[] } } } } })?.cmView?.widget;
+		const children = widget?.child?.controller?._children;
+		if (!Array.isArray(children)) return;
+		const table = children.find((c: unknown) => {
+			const m = c as BasesTableView;
+			return typeof m?.display === 'function' && Array.isArray(m?.groups) && !!m?.scrollEl;
+		}) as BasesTableView | undefined;
+		if (!table) return;
+
+		this._rerenderingEmbed = true;
+		requestAnimationFrame(() => {
+			table.display?.();
+			table.updateVirtualDisplay?.();
+			requestAnimationFrame(() => {
+				// Re-apply collapse state so other groups stay collapsed after rerender
+				this._applyEmbedCollapse(embedEl);
+				this._patchEmbedHeaders(embedEl);
+				this._rerenderingEmbed = false;
+			});
+		});
+	}
+
+	private _reflowEmbed(_embedEl: HTMLElement) {
+		// Virtual positioning is managed by Bases' renderer — we don't touch it.
+		// Collapse state is controlled via data-cgb-collapsed attribute + CSS.
 	}
 
 	private _collapseAll() {
