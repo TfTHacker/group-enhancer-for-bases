@@ -804,6 +804,21 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 			this._applyEmbedCollapse(embedEl);
 			this._syncHeaderUi(header);
 			this._applyCollapsedModelToEmbed(embedEl);
+			
+			// If expanding a group, scroll it into view
+			if (wasCollapsed) {
+				requestAnimationFrame(() => {
+					const table = header.closest('.bases-table');
+					if (table) {
+						const tableRect = table.getBoundingClientRect();
+						const viewportHeight = window.innerHeight;
+						// If the table is outside the viewport (or only partially visible)
+						if (tableRect.top < 0 || tableRect.bottom > viewportHeight) {
+							table.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+						}
+					}
+				});
+			}
 			return;
 		}
 
@@ -1010,20 +1025,18 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 		const origUpdate = Object.getPrototypeOf(table).updateVirtualDisplay!.bind(table);
 		const self = this;
 		table.updateVirtualDisplay = function(this: BasesTableView) {
-			if (!self._rerenderingEmbed) {
-				// Re-apply collapsed cache so virtual renderer uses correct entry counts
-				const src = embedEl.getAttribute('src') ?? '';
-				const resolved = self._getResolvedSettings();
-				if (this.data && this.__cgbOriginalGroupedData) {
-					this.data.groupedDataCache = this.__cgbOriginalGroupedData.map(group => {
-						const clone = { ...group } as BasesGroup;
-						const groupValue = self._normalizeGroupValue(self._groupValue(group));
-						const key = `${src}::${groupValue}`;
-						const collapsed = resolved.enableCollapsibleGroups && (resolved.collapseAllByDefault || self._collapsedKeys.has(key));
-						clone.entries = collapsed ? [] : group.entries.slice();
-						return clone;
-					});
-				}
+			// ALWAYS re-apply collapsed cache before updateVirtualDisplay
+			const src = embedEl.getAttribute('src') ?? '';
+			const resolved = self._getResolvedSettings();
+			if (this.data && this.__cgbOriginalGroupedData) {
+				this.data.groupedDataCache = this.__cgbOriginalGroupedData.map(group => {
+					const clone = { ...group } as BasesGroup;
+					const groupValue = self._normalizeGroupValue(self._groupValue(group));
+					const key = `${src}::${groupValue}`;
+					const collapsed = resolved.enableCollapsibleGroups && (resolved.collapseAllByDefault || self._collapsedKeys.has(key));
+					clone.entries = collapsed ? [] : group.entries.slice();
+					return clone;
+				});
 			}
 			return origUpdate();
 		};
