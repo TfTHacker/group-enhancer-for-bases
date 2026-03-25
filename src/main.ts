@@ -553,6 +553,9 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 				break;
 		}
 
+		btn.addEventListener('pointerdown', e => {
+			e.stopPropagation(); // prevent canvas drag
+		});
 		btn.addEventListener('pointerup', e => {
 			if ((e.target as HTMLElement).closest('button') !== btn) return;
 			e.preventDefault();
@@ -620,6 +623,11 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 
 			// Cache the header key for faster access
 			this._headerKeyCache.set(header, this._headerKey(header));
+
+			// In canvas nodes, stop pointerdown from bubbling to prevent canvas drag
+			if (header.closest('.canvas-node')) {
+				header.addEventListener('pointerdown', e => e.stopPropagation());
+			}
 		}
 		this._syncHeaderUi(header);
 	}
