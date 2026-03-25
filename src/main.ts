@@ -1564,6 +1564,7 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 		this._baseConfigCacheDirty = true;
 		// If collapsible groups disabled, clean up all plugin DOM state
 		if (!this.settings.enableCollapsibleGroups) {
+			this._collapsedKeys.clear();
 			document.querySelectorAll('.cgb-chevron').forEach(el => el.remove());
 			document.querySelectorAll('[data-cgb-patched]').forEach(el => {
 				el.removeAttribute('data-cgb-patched');
