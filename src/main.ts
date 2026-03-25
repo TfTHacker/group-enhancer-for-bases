@@ -926,14 +926,48 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 		table.display?.();
 		table.updateVirtualDisplay?.();
 
-		// Patch headers AFTER display() re-creates them, then release the guard
-		requestAnimationFrame(() => {
-			this._patchEmbedHeaders(embedEl);
-			this._patchToolbars();
+		// With position:static CSS, rows added by updateVirtualDisplay stay in the DOM.
+		// But only rows visible in the current window viewport are added per call.
+		// Simulate scrolling through the page to ensure all rows get rendered.
+		this._populateAllEmbedRows(table, embedEl);
+	}
+
+	private _populateAllEmbedRows(table: BasesTableView, embedEl: HTMLElement) {
+		// With position:static CSS on tbody rows, rows added by updateVirtualDisplay stay in
+		// the DOM — they're never removed because there's no virtual position to cull by.
+		// We just need to call updateVirtualDisplay at each "scroll position" to ensure all
+		// rows get added. We do this by temporarily scrolling the page scroller.
+		const scroller = embedEl.closest('.cm-scroller') as HTMLElement | null;
+		if (!scroller) {
+			// Fallback: patch headers and release guard
 			requestAnimationFrame(() => {
-				this._rerenderingEmbed = false;
+				this._patchEmbedHeaders(embedEl);
+				this._patchToolbars();
+				requestAnimationFrame(() => { this._rerenderingEmbed = false; });
 			});
-		});
+			return;
+		}
+
+		const origScrollTop = scroller.scrollTop;
+		const scrollHeight = scroller.scrollHeight;
+		const step = 400; // px per step
+		let pos = 0;
+
+		const tick = () => {
+			if (pos <= scrollHeight) {
+				scroller.scrollTop = pos;
+				table.updateVirtualDisplay?.();
+				pos += step;
+				requestAnimationFrame(tick);
+			} else {
+				// Restore scroll position
+				scroller.scrollTop = origScrollTop;
+				this._patchEmbedHeaders(embedEl);
+				this._patchToolbars();
+				requestAnimationFrame(() => { this._rerenderingEmbed = false; });
+			}
+		};
+		requestAnimationFrame(tick);
 	}
 
 	private _watchEmbedVisibility(embedEl: HTMLElement) {
@@ -948,16 +982,11 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 		const io = new IntersectionObserver((entries) => {
 			for (const entry of entries) {
 				if (!entry.isIntersecting) continue;
-				const widget = (embedEl as unknown as { cmView?: { widget?: { child?: { controller?: { _children?: unknown[] } } } } })?.cmView?.widget;
-				const children = widget?.child?.controller?._children;
-				if (!Array.isArray(children)) continue;
-				const table = children.find((c: unknown) => {
-					const m = c as BasesTableView;
-					return typeof m?.display === 'function' && Array.isArray(m?.groups) && !!m?.scrollEl;
-				}) as BasesTableView | undefined;
-				if (table?.updateVirtualDisplay && !this._rerenderingEmbed) {
-					table.updateVirtualDisplay();
-				}
+				if (this._rerenderingEmbed) continue;
+				// Re-apply the full data model so all expanded groups get their rows rendered.
+				// updateVirtualDisplay alone isn't enough — it only renders rows in the current
+				// viewport window, so groups expanded but off-screen still appear empty.
+				this._applyCollapsedModelToEmbed(embedEl);
 			}
 		}, { threshold: 0.01 });
 		io.observe(embedEl);
