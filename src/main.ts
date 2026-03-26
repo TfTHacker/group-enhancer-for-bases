@@ -1241,6 +1241,7 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 
 	private _applyCollapsedModelToActiveTable() {
 		const resolved = this._getResolvedSettings();
+		if (!resolved.enableCollapsibleGroups) return;
 		const table = this._getActiveTableView();
 		const data = table?.data;
 		if (!table || !data) return;
