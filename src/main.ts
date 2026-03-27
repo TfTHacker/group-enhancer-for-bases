@@ -1,4 +1,4 @@
-import { App, Plugin, PluginSettingTab, Setting, TFile, WorkspaceLeaf, setIcon } from 'obsidian';
+import { App, Notice, Plugin, PluginSettingTab, Setting, TFile, WorkspaceLeaf, setIcon } from 'obsidian';
 import { BaseConfigManager, BaseGroupEnhancerConfig } from './base-config';
 import { ConfigResolver, ResolvedConfig } from './config-resolver';
 
@@ -21,26 +21,54 @@ const DEFAULT_SETTINGS: CgbSettings = {
 };
 
 type BasesGroup = {
-	key?: { toString?: () => string; renderTo?: (el: HTMLElement, ctx: unknown) => void };
+	key?: { toString?: () => string; renderTo?: (el: HTMLElement, ctx: unknown) => void; data?: string };
 	entries: unknown[];
 	tableEl?: HTMLElement;
 	tbodyEl?: HTMLElement;
 	summaryRow?: { shouldDisplay?: () => boolean; el?: HTMLElement };
 };
 
+type BasesRowEntry = {
+	file?: TFile;
+	frontmatter?: Record<string, unknown>;
+};
+
+type BasesRowCell = {
+	view?: unknown;
+	prop?: unknown;
+	el?: HTMLElement;
+	renderer?: unknown;
+};
+
+type BasesRow = {
+	cells?: BasesRowCell[];
+	view?: unknown;
+	el?: HTMLElement;
+	entry?: BasesRowEntry;
+};
+
+type BasesQueryController = {
+	update?: () => void;
+};
+
 type BasesData = {
 	groupedDataCache?: BasesGroup[] | null;
 	groupedData?: BasesGroup[];
+	properties?: string[];
+	data?: unknown[];
 };
 
 type BasesTableView = {
 	config?: { get?: (key: string) => unknown; groupBy?: { property?: string } };
 	data?: BasesData;
 	groups?: BasesGroup[];
+	rows?: BasesRow[];
 	scrollEl?: HTMLElement;
 	containerEl?: HTMLElement;
 	display?: () => void;
 	updateVirtualDisplay?: () => void;
+	onDataUpdated?: () => void;
+	queryController?: BasesQueryController;
 	lastViewport?: { left: number; right: number; top: number; bottom: number };
 	createGroupHeadingEl?: (group: BasesGroup) => HTMLElement | null;
 	__cgbOriginalGroupedData?: BasesGroup[];
@@ -62,6 +90,21 @@ type RuntimeContext = {
 	afterRender: () => void;
 };
 
+type WritableGroupField = {
+	property: string;
+	frontmatterKey: string;
+};
+
+type DragState = {
+	runtimeKind: RuntimeKind;
+	runtimeSourceKey: string;
+	file: TFile;
+	rowEl: HTMLElement;
+	handleEl: HTMLElement;
+	sourceGroupValue: string;
+	dragPreviewEl?: HTMLElement | null;
+};
+
 export default class CollapsibleGroupsPlugin extends Plugin {
 	settings: CgbSettings = DEFAULT_SETTINGS;
 	private _foldState: Record<string, boolean> = {};
@@ -80,6 +123,13 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 	private _reloadingDirectLeaf = false;
 	private _directRefreshInFlight = false;
 	private _lastDirectRefreshAt = 0;
+	private _boundDragOver?: (e: DragEvent) => void;
+	private _boundDrop?: (e: DragEvent) => void;
+	private _boundDragEnd?: (_e: DragEvent) => void;
+	private _dragState: DragState | null = null;
+	private _hoveredDropTable: HTMLElement | null = null;
+	private _dragMoveInFlight = false;
+	private _suppressHeaderToggleUntil = 0;
 
 	// Base config management
 	private _baseConfigManager: BaseConfigManager | null = null;
@@ -114,13 +164,19 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 	}
 
 	private _removeRuntimeDomState(root: ParentNode = document) {
-		root.querySelectorAll('.cgb-toolbar, .cgb-chevron, .cgb-count-badge').forEach(el => el.remove());
-		root.querySelectorAll<HTMLElement>('[data-cgb-patched],[data-cgb-container-patched],[data-cgb-initializing],[data-cgb-collapsed]').forEach(el => {
+		root.querySelectorAll('.cgb-toolbar, .cgb-chevron, .cgb-count-badge, .cgb-row-drag-handle').forEach(el => el.remove());
+		root.querySelectorAll<HTMLElement>('[data-cgb-patched],[data-cgb-container-patched],[data-cgb-initializing],[data-cgb-collapsed],[data-cgb-drop-target],[data-cgb-row-draggable],[data-cgb-row-drag-cell]').forEach(el => {
 			el.removeAttribute('data-cgb-patched');
 			el.removeAttribute('data-cgb-container-patched');
 			el.removeAttribute('data-cgb-initializing');
 			el.removeAttribute('data-cgb-collapsed');
+			el.removeAttribute('data-cgb-drop-target');
+			el.removeAttribute('data-cgb-row-draggable');
+			el.removeAttribute('data-cgb-row-drag-cell');
 			if (el.classList.contains('bases-group-heading')) el.style.cursor = '';
+		});
+		root.querySelectorAll<HTMLElement>('.is-cgb-drop-target, .is-cgb-drop-active, .is-cgb-row-dragging').forEach(el => {
+			el.classList.remove('is-cgb-drop-target', 'is-cgb-drop-active', 'is-cgb-row-dragging');
 		});
 		root.querySelectorAll<HTMLElement>('.bases-tbody').forEach(el => {
 			el.style.height = '';
@@ -189,12 +245,18 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 			el.style.height = '';
 		});
 		runtime.hostEl.parentElement?.querySelector('.cgb-toolbar')?.remove();
-		runtime.viewEl.querySelectorAll('.cgb-chevron, .cgb-count-badge').forEach(el => el.remove());
-		runtime.viewEl.querySelectorAll<HTMLElement>('[data-cgb-patched],[data-cgb-container-patched],[data-cgb-initializing]').forEach(el => {
+		runtime.viewEl.querySelectorAll('.cgb-chevron, .cgb-count-badge, .cgb-row-drag-handle').forEach(el => el.remove());
+		runtime.viewEl.querySelectorAll<HTMLElement>('[data-cgb-patched],[data-cgb-container-patched],[data-cgb-initializing],[data-cgb-drop-target],[data-cgb-row-draggable],[data-cgb-row-drag-cell]').forEach(el => {
 			el.removeAttribute('data-cgb-patched');
 			el.removeAttribute('data-cgb-container-patched');
 			el.removeAttribute('data-cgb-initializing');
+			el.removeAttribute('data-cgb-drop-target');
+			el.removeAttribute('data-cgb-row-draggable');
+			el.removeAttribute('data-cgb-row-drag-cell');
 			if (el.classList.contains('bases-group-heading')) el.style.cursor = '';
+		});
+		runtime.viewEl.querySelectorAll<HTMLElement>('.is-cgb-drop-target, .is-cgb-drop-active, .is-cgb-row-dragging').forEach(el => {
+			el.classList.remove('is-cgb-drop-target', 'is-cgb-drop-active', 'is-cgb-row-dragging');
 		});
 		runtime.table.display?.();
 		runtime.table.updateVirtualDisplay?.();
@@ -306,6 +368,7 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 			}
 			this._patchToolbars();
 			this._patchHeaders();
+			for (const runtime of runtimes) this._patchDraggableRows(runtime);
 			requestAnimationFrame(() => {
 				if (hasDirectRuntime) {
 					this._directRefreshInFlight = false;
@@ -583,6 +646,8 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 		canvasNodeEls.forEach(el => {
 			if (el.querySelector('.bases-view.is-grouped')) {
 				this._applyCanvasNodeCollapse(el);
+				const runtime = this._getCanvasRuntime(el);
+				if (runtime) this._patchDraggableRows(runtime);
 			}
 		});
 	}
@@ -601,6 +666,8 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 			this._patchEmbedHeaders(embedEl);
 			this._applyEmbedCollapse(embedEl);
 			this._watchEmbedVisibility(embedEl);
+			const runtime = this._getEmbedRuntime(embedEl);
+			if (runtime) this._patchDraggableRows(runtime);
 			const notYetInitialized = !(embedEl as HTMLElement & { __cgbModelApplied?: boolean }).__cgbModelApplied;
 			if (notYetInitialized && !this._rerenderingEmbed) {
 				(embedEl as HTMLElement & { __cgbModelApplied?: boolean }).__cgbModelApplied = true;
@@ -727,13 +794,20 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 		if (this._patchTimer) clearTimeout(this._patchTimer);
 		if (this._refreshTimer) clearTimeout(this._refreshTimer);
 		if (this._boundPointerUp) document.removeEventListener('pointerup', this._boundPointerUp, true);
+		if (this._boundDragOver) document.removeEventListener('dragover', this._boundDragOver, true);
+		if (this._boundDrop) document.removeEventListener('drop', this._boundDrop, true);
+		if (this._boundDragEnd) document.removeEventListener('dragend', this._boundDragEnd, true);
 		this._styleEl?.remove();
 		this._headerKeyCache.clear();
-		document.querySelectorAll('.cgb-toolbar, .cgb-chevron, .cgb-count-badge').forEach(el => el.remove());
-		document.querySelectorAll('[data-cgb-patched],[data-cgb-container-patched]').forEach(el => {
+		document.querySelectorAll('.cgb-toolbar, .cgb-chevron, .cgb-count-badge, .cgb-row-drag-handle').forEach(el => el.remove());
+		document.querySelectorAll('[data-cgb-patched],[data-cgb-container-patched],[data-cgb-drop-target],[data-cgb-row-draggable],[data-cgb-row-drag-cell]').forEach(el => {
 			el.removeAttribute('data-cgb-patched');
 			el.removeAttribute('data-cgb-container-patched');
+			el.removeAttribute('data-cgb-drop-target');
+			el.removeAttribute('data-cgb-row-draggable');
+			el.removeAttribute('data-cgb-row-drag-cell');
 		});
+		this._clearDropTargetHighlight();
 		this._resetGroupedDataCache();
 		this._displayActiveTable();
 	}
@@ -767,6 +841,69 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 .cgb-toolbar-btn-icon { display: inline-flex; align-items: center; justify-content: center; width: 14px; height: 14px; }
 .cgb-toolbar-btn.is-icon-only { padding: 4px 6px; gap: 0; }
 .cgb-count-badge { font-size: var(--font-ui-smaller); color: var(--text-muted); margin-left: 6px; }
+.bases-table.is-cgb-drop-target { transition: background-color 120ms ease, box-shadow 120ms ease; }
+.bases-table.is-cgb-drop-active {
+  background: color-mix(in srgb, var(--background-modifier-hover) 65%, transparent);
+  box-shadow: inset 0 0 0 1px var(--interactive-accent);
+}
+.bases-tr[data-cgb-row-draggable="true"] > .bases-td:first-child { position: relative; }
+.bases-tr[data-cgb-row-draggable="true"] > .bases-td:first-child > .bases-table-cell { padding-left: 22px; }
+.cgb-row-drag-handle {
+  position: absolute;
+  inset-inline-start: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 18px;
+  color: var(--text-muted);
+  opacity: 0.9;
+  cursor: grab;
+  z-index: 1;
+}
+.cgb-row-drag-handle:hover {
+  color: var(--text-normal);
+  opacity: 1;
+}
+.cgb-row-drag-handle:active { cursor: grabbing; }
+.cgb-row-drag-handle.is-cgb-active {
+  color: var(--text-normal);
+  background: var(--background-modifier-hover);
+  border-radius: 4px;
+}
+.cgb-row-drag-handle svg, .cgb-row-drag-handle path { pointer-events: none; }
+.bases-tr.is-cgb-row-dragging { opacity: 0.45; }
+body.is-cgb-dragging,
+body.is-cgb-dragging * {
+  cursor: grabbing !important;
+}
+.cgb-drag-preview {
+  position: fixed;
+  top: -9999px;
+  left: -9999px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: var(--background-primary);
+  color: var(--text-normal);
+  border: 1px solid var(--interactive-accent);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.18);
+  font-size: var(--font-ui-small);
+  white-space: nowrap;
+  pointer-events: none;
+  z-index: 9999;
+}
+.cgb-drag-preview-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--interactive-accent);
+  flex-shrink: 0;
+}
 .bases-view.is-grouped[data-cgb-initializing="true"] { visibility: hidden; }
 .internal-embed .bases-view.is-grouped .bases-table[data-cgb-collapsed="true"] > .bases-tbody { display: none !important; }
 .internal-embed .bases-view.is-grouped .bases-table-container { overflow: visible !important; }
@@ -778,6 +915,7 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 
 	private _bindDelegatedEvents() {
 		this._boundPointerUp = (e: PointerEvent) => {
+			if (this._dragState || this._dragMoveInFlight || Date.now() < this._suppressHeaderToggleUntil) return;
 			const target = e.target as HTMLElement | null;
 			if (!target) return;
 			const header = target.closest('.bases-group-heading[data-cgb-patched]') as HTMLElement | null;
@@ -794,6 +932,41 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 			});
 		};
 		document.addEventListener('pointerup', this._boundPointerUp, true);
+
+		this._boundDragOver = (e: DragEvent) => {
+			if (!this._dragState) return;
+			const target = e.target as HTMLElement | null;
+			const tableEl = target?.closest('.bases-table[data-cgb-drop-target="true"]') as HTMLElement | null;
+			if (!tableEl || !this._isTableValidDropTarget(tableEl)) {
+				this._clearDropTargetHighlight();
+				return;
+			}
+			e.preventDefault();
+			e.stopPropagation();
+			if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+			this._setDropTargetHighlight(tableEl);
+		};
+		document.addEventListener('dragover', this._boundDragOver, true);
+
+		this._boundDrop = (e: DragEvent) => {
+			if (!this._dragState) return;
+			const target = e.target as HTMLElement | null;
+			const tableEl = target?.closest('.bases-table[data-cgb-drop-target="true"]') as HTMLElement | null;
+			this._suppressHeaderToggleUntil = Date.now() + 250;
+			if (!tableEl || !this._isTableValidDropTarget(tableEl)) {
+				this._clearDropTargetHighlight();
+				return;
+			}
+			e.preventDefault();
+			e.stopPropagation();
+			void this._handleRowDrop(tableEl);
+		};
+		document.addEventListener('drop', this._boundDrop, true);
+
+		this._boundDragEnd = () => {
+			this._clearDragState();
+		};
+		document.addEventListener('dragend', this._boundDragEnd, true);
 	}
 
 	private _observeLegacy() {
@@ -822,6 +995,7 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 			}
 			const result = table.__cgbOriginalUpdateVirtualDisplay?.();
 			runtime.afterRender();
+			this._patchDraggableRows(runtime);
 			if (runtime.kind !== 'direct') {
 				this._patchToolbars();
 				this._patchHeaders();
@@ -846,6 +1020,220 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 		runtime.table.display?.();
 		runtime.table.updateVirtualDisplay?.();
 		this._syncRuntimeDom(runtime, resolved);
+		this._patchDraggableRows(runtime);
+	}
+
+	private _getWritableGroupField(table: BasesTableView): WritableGroupField | null {
+		const property = table.config?.groupBy?.property;
+		if (typeof property !== 'string' || !property.length) return null;
+		if (property.startsWith('file.')) return null;
+		const frontmatterKey = property.startsWith('note.') ? property.slice(5) : property;
+		if (!frontmatterKey || frontmatterKey.includes('.')) return null;
+		const lowered = frontmatterKey.toLowerCase();
+		if (['tags', 'aliases', 'cssclasses', 'position'].includes(lowered)) return null;
+		return { property, frontmatterKey };
+	}
+
+	private _patchDraggableRows(runtime: RuntimeContext) {
+		const writableField = this._getWritableGroupField(runtime.table);
+		const headers = runtime.getHeaders();
+		for (const header of headers) {
+			const tableEl = header.closest('.bases-table') as HTMLElement | null;
+			if (writableField) {
+				header.setAttribute('data-cgb-drop-target', 'true');
+				tableEl?.setAttribute('data-cgb-drop-target', 'true');
+				tableEl?.classList.add('is-cgb-drop-target');
+			} else {
+				header.removeAttribute('data-cgb-drop-target');
+				tableEl?.removeAttribute('data-cgb-drop-target');
+				tableEl?.classList.remove('is-cgb-drop-target', 'is-cgb-drop-active');
+			}
+		}
+
+		runtime.viewEl.querySelectorAll<HTMLElement>('.bases-tr[data-cgb-row-draggable="true"]').forEach(rowEl => {
+			if (!writableField) {
+				rowEl.removeAttribute('data-cgb-row-draggable');
+				rowEl.classList.remove('is-cgb-row-dragging');
+				rowEl.querySelector('.cgb-row-drag-handle')?.remove();
+			}
+		});
+		runtime.viewEl.querySelectorAll<HTMLElement>('[data-cgb-row-drag-cell]').forEach(cell => {
+			if (!writableField) cell.removeAttribute('data-cgb-row-drag-cell');
+		});
+		if (!writableField) return;
+
+		for (const row of runtime.table.rows ?? []) {
+			const rowEl = row.el;
+			const file = row.entry?.file;
+			if (!rowEl || !(rowEl instanceof HTMLElement) || !file) continue;
+			if (!runtime.viewEl.contains(rowEl)) continue;
+			rowEl.setAttribute('data-cgb-row-draggable', 'true');
+			const firstCell = rowEl.querySelector<HTMLElement>(':scope > .bases-td');
+			if (!firstCell) continue;
+			firstCell.setAttribute('data-cgb-row-drag-cell', 'true');
+			let handle = firstCell.querySelector<HTMLElement>(':scope > .cgb-row-drag-handle');
+			if (!handle) {
+				handle = document.createElement('span');
+				handle.className = 'cgb-row-drag-handle';
+				handle.draggable = true;
+				handle.setAttribute('aria-label', 'Move row to another group');
+				handle.setAttribute('title', 'Drag to move row to another group');
+				handle.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M9 5h.01M9 12h.01M9 19h.01M15 5h.01M15 12h.01M15 19h.01"/></svg>`;
+				handle.addEventListener('dragstart', event => {
+					this._onRowDragStart(event, runtime, rowEl, file, handle as HTMLElement);
+				});
+				handle.addEventListener('dragend', () => {
+					this._clearDragState();
+				});
+				firstCell.prepend(handle);
+			}
+		}
+	}
+
+	private _onRowDragStart(event: DragEvent, runtime: RuntimeContext, rowEl: HTMLElement, file: TFile, handleEl: HTMLElement) {
+		if (this._dragMoveInFlight) {
+			event.preventDefault();
+			return;
+		}
+		const writableField = this._getWritableGroupField(runtime.table);
+		if (!writableField) {
+			event.preventDefault();
+			return;
+		}
+		const sourceGroupValue = this._normalizeGroupValue(
+			rowEl.closest('.bases-table')?.querySelector('.bases-group-value')?.textContent?.trim(),
+		);
+		this._clearDragState();
+		this._dragState = {
+			runtimeKind: runtime.kind,
+			runtimeSourceKey: runtime.sourceKey,
+			file,
+			rowEl,
+			handleEl,
+			sourceGroupValue,
+			dragPreviewEl: null,
+		};
+		document.body.classList.add('is-cgb-dragging');
+		rowEl.classList.add('is-cgb-row-dragging');
+		handleEl.classList.add('is-cgb-active');
+		if (event.dataTransfer) {
+			event.dataTransfer.effectAllowed = 'move';
+			event.dataTransfer.setData('text/plain', file.path);
+			const dragPreviewEl = this._createDragPreview(file.basename, sourceGroupValue);
+			if (dragPreviewEl) {
+				this._dragState.dragPreviewEl = dragPreviewEl;
+				event.dataTransfer.setDragImage(dragPreviewEl, 14, 14);
+			}
+		}
+	}
+
+	private _createDragPreview(fileName: string, sourceGroupValue: string): HTMLElement | null {
+		const previewEl = document.createElement('div');
+		previewEl.className = 'cgb-drag-preview';
+		previewEl.innerHTML = `<span class="cgb-drag-preview-dot"></span><span>Moving ${fileName} from ${sourceGroupValue}</span>`;
+		document.body.appendChild(previewEl);
+		return previewEl;
+	}
+
+	private _getRuntimeForElement(el: HTMLElement): RuntimeContext | null {
+		const embedEl = el.closest('.internal-embed.bases-embed') as HTMLElement | null;
+		if (embedEl) return this._getEmbedRuntime(embedEl);
+		const canvasNodeEl = el.closest('.canvas-node') as HTMLElement | null;
+		if (canvasNodeEl) return this._getCanvasRuntime(canvasNodeEl);
+		return this._getDirectRuntime();
+	}
+
+	private _isTableValidDropTarget(tableEl: HTMLElement): boolean {
+		const runtime = this._getRuntimeForElement(tableEl);
+		if (!runtime || !this._dragState) return false;
+		return runtime.kind === this._dragState.runtimeKind &&
+			runtime.sourceKey === this._dragState.runtimeSourceKey &&
+			runtime.viewEl.contains(tableEl);
+	}
+
+	private _setDropTargetHighlight(tableEl: HTMLElement) {
+		if (this._hoveredDropTable === tableEl) return;
+		if (this._hoveredDropTable) this._hoveredDropTable.classList.remove('is-cgb-drop-active');
+		this._hoveredDropTable = tableEl;
+		tableEl.classList.add('is-cgb-drop-active');
+	}
+
+	private _clearDropTargetHighlight() {
+		if (!this._hoveredDropTable) return;
+		this._hoveredDropTable.classList.remove('is-cgb-drop-active');
+		this._hoveredDropTable = null;
+	}
+
+	private _clearDragState() {
+		this._clearDropTargetHighlight();
+		document.body.classList.remove('is-cgb-dragging');
+		this._dragState?.handleEl?.classList.remove('is-cgb-active');
+		this._dragState?.dragPreviewEl?.remove();
+		if (this._dragState?.rowEl) this._dragState.rowEl.classList.remove('is-cgb-row-dragging');
+		this._dragState = null;
+	}
+
+	private _setGroupedFrontmatterValue(frontmatter: Record<string, unknown>, key: string, groupValue: string) {
+		if (groupValue === 'None') delete frontmatter[key];
+		else frontmatter[key] = groupValue;
+	}
+
+	private _invalidateGroupedCaches(table: BasesTableView) {
+		if (table.data) table.data.groupedDataCache = null;
+		delete table.__cgbOriginalGroupedData;
+		delete table.__cgbGroupCountMap;
+	}
+
+	private _refreshRuntimeAfterMove(runtime: RuntimeContext) {
+		if (!runtime) return;
+		this._invalidateGroupedCaches(runtime.table);
+		runtime.table.queryController?.update?.();
+		runtime.table.onDataUpdated?.();
+		window.setTimeout(() => {
+			if (runtime.kind === 'embed') {
+				this._refreshEmbeddedInActiveLeaf();
+				return;
+			}
+			if (runtime.kind === 'canvas') {
+				this._refreshCanvasLeaf();
+				return;
+			}
+			this._refreshActiveRuntimes();
+		}, 80);
+	}
+
+	private async _handleRowDrop(tableEl: HTMLElement) {
+		const dragState = this._dragState;
+		const runtime = this._getRuntimeForElement(tableEl);
+		if (!dragState || !runtime || !this._isTableValidDropTarget(tableEl)) {
+			this._clearDragState();
+			return;
+		}
+		const writableField = this._getWritableGroupField(runtime.table);
+		if (!writableField) {
+			this._clearDragState();
+			return;
+		}
+		const targetGroupValue = this._normalizeGroupValue(tableEl.querySelector('.bases-group-value')?.textContent?.trim());
+		if (targetGroupValue === dragState.sourceGroupValue) {
+			this._clearDragState();
+			return;
+		}
+		if (this._dragMoveInFlight) return;
+		this._dragMoveInFlight = true;
+		this._suppressHeaderToggleUntil = Date.now() + 250;
+		try {
+			await this.app.fileManager.processFrontMatter(dragState.file, frontmatter => {
+				this._setGroupedFrontmatterValue(frontmatter, writableField.frontmatterKey, targetGroupValue);
+			});
+			this._refreshRuntimeAfterMove(runtime);
+		} catch (error) {
+			console.error('[CGBDrag] Failed to move row between groups:', error);
+			new Notice('Failed to move row to the selected group.');
+		} finally {
+			this._dragMoveInFlight = false;
+			this._clearDragState();
+		}
 	}
 
 	private _syncRuntimeDom(runtime: RuntimeContext, resolved: ResolvedConfig) {
