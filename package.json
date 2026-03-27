@@ -19,11 +19,11 @@
 	"author": "TfTHacker",
 	"license": "MIT",
 	"devDependencies": {
-		"@types/node": "24.6.1",
-		"@typescript-eslint/eslint-plugin": "5.29.0",
-		"@typescript-eslint/parser": "5.29.0",
-		"builtin-modules": "3.3.0",
-		"esbuild-wasm": "^0.25.10",
+		"@types/node": "25.5.0",
+		"@typescript-eslint/eslint-plugin": "8.57.2",
+		"@typescript-eslint/parser": "8.57.2",
+		"builtin-modules": "5.0.0",
+		"esbuild-wasm": "^0.27.4",
 		"obsidian": "latest",
 		"tslib": "2.8.1",
 		"typescript": "^5.9.3"

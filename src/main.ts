@@ -1,4 +1,4 @@
-import { App, Plugin, PluginSettingTab, Setting, setIcon } from 'obsidian';
+import { App, Plugin, PluginSettingTab, Setting, TFile, WorkspaceLeaf, setIcon } from 'obsidian';
 import { BaseConfigManager, BaseGroupEnhancerConfig } from './base-config';
 import { ConfigResolver, ResolvedConfig } from './config-resolver';
 
@@ -46,6 +46,20 @@ type BasesTableView = {
 	__cgbOriginalGroupedData?: BasesGroup[];
 	__cgbGroupCountMap?: Record<string, number>;
 	__cgbGapFixerInstalled?: boolean;
+	__cgbOriginalUpdateVirtualDisplay?: (() => void) | null;
+	__cgbWrappedMode?: string | null;
+};
+
+type RuntimeKind = 'direct' | 'embed' | 'canvas';
+
+type RuntimeContext = {
+	kind: RuntimeKind;
+	hostEl: HTMLElement;
+	viewEl: HTMLElement;
+	table: BasesTableView;
+	sourceKey: string;
+	getHeaders: () => HTMLElement[];
+	afterRender: () => void;
 };
 
 export default class CollapsibleGroupsPlugin extends Plugin {
@@ -63,6 +77,9 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 	private _patchedHeaders: Set<HTMLElement> = new Set();
 	private _lastHeaderCount: number = 0;
 	private _headerKeyCache: Map<HTMLElement, string> = new Map();
+	private _reloadingDirectLeaf = false;
+	private _directRefreshInFlight = false;
+	private _lastDirectRefreshAt = 0;
 
 	// Base config management
 	private _baseConfigManager: BaseConfigManager | null = null;
@@ -72,10 +89,278 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 	private _cachedResolvedSettings: ResolvedConfig | null = null;
 	private _baseConfigCacheDirty: boolean = true;
 
+	private _syncCollapsedKeysFromFoldState() {
+		this._collapsedKeys = new Set(Object.keys(this._foldState));
+	}
+
+	private _isGloballyEnabled(): boolean {
+		return this.settings.enableCollapsibleGroups;
+	}
+
+	private _isRuntimeEnabled(): boolean {
+		return this._isGloballyEnabled() && this._getResolvedSettings().enableCollapsibleGroups;
+	}
+
+	private _isActiveGroupedBasesView(): boolean {
+		const leaf = this.app.workspace.activeLeaf;
+		if (!leaf || leaf.view?.getViewType?.() !== 'bases') return false;
+		return !!leaf.view.containerEl?.querySelector('.bases-view.is-grouped');
+	}
+
+	private _resetPatchedHeaderState() {
+		this._patchedHeaders.clear();
+		this._headerKeyCache.clear();
+		this._lastHeaderCount = 0;
+	}
+
+	private _removeRuntimeDomState(root: ParentNode = document) {
+		root.querySelectorAll('.cgb-toolbar, .cgb-chevron, .cgb-count-badge').forEach(el => el.remove());
+		root.querySelectorAll<HTMLElement>('[data-cgb-patched],[data-cgb-container-patched],[data-cgb-initializing],[data-cgb-collapsed]').forEach(el => {
+			el.removeAttribute('data-cgb-patched');
+			el.removeAttribute('data-cgb-container-patched');
+			el.removeAttribute('data-cgb-initializing');
+			el.removeAttribute('data-cgb-collapsed');
+			if (el.classList.contains('bases-group-heading')) el.style.cursor = '';
+		});
+		root.querySelectorAll<HTMLElement>('.bases-tbody').forEach(el => {
+			el.style.height = '';
+		});
+		root.querySelectorAll<HTMLElement>('.internal-embed.bases-embed').forEach(el => {
+			delete (el as HTMLElement & { __cgbModelApplied?: boolean }).__cgbModelApplied;
+			delete (el as HTMLElement & { __cgbVisibilityWatched?: boolean }).__cgbVisibilityWatched;
+		});
+	}
+
+	private _getManagedLeaves(): WorkspaceLeaf[] {
+		const leaves: WorkspaceLeaf[] = [];
+		this.app.workspace.iterateAllLeaves(leaf => {
+			const type = leaf.view?.getViewType?.();
+			if (type === 'bases' || type === 'markdown' || type === 'canvas') leaves.push(leaf);
+		});
+		return leaves;
+	}
+
+	private _getGroupedViewInLeaf(leaf: WorkspaceLeaf | null | undefined): HTMLElement | null {
+		return (leaf?.view?.containerEl?.querySelector('.bases-view.is-grouped') as HTMLElement | null) ?? null;
+	}
+
+	private _isGroupedTableView(table: BasesTableView | null | undefined, leaf?: WorkspaceLeaf | null): boolean {
+		if (!table) return false;
+		const groupBy = table.config?.groupBy?.property;
+		if (typeof groupBy === 'string' && groupBy.length > 0) return true;
+		if (leaf && this._getGroupedViewInLeaf(leaf)) return true;
+		return false;
+	}
+
+	private _buildCollapsedGroups(table: BasesTableView, sourceKey: string, resolved: ResolvedConfig): BasesGroup[] {
+		return this._getOriginalGroupedData(table).map(group => {
+			const clone = { ...group } as BasesGroup;
+			const key = `${sourceKey}::${this._groupValue(group)}`;
+			const collapsed = resolved.enableCollapsibleGroups && (resolved.collapseAllByDefault || this._collapsedKeys.has(key));
+			clone.entries = collapsed ? [] : group.entries.slice();
+			return clone;
+		});
+	}
+
+	private _cleanupTableRuntime(table: BasesTableView | null | undefined) {
+		if (!table) return;
+		if (table.__cgbOriginalUpdateVirtualDisplay) {
+			table.updateVirtualDisplay = table.__cgbOriginalUpdateVirtualDisplay;
+		}
+		table.__cgbOriginalUpdateVirtualDisplay = null;
+		table.__cgbWrappedMode = null;
+		if (table.data) {
+			table.data.groupedDataCache = null;
+		}
+		delete table.__cgbOriginalGroupedData;
+		delete table.__cgbGroupCountMap;
+		delete table.__cgbGapFixerInstalled;
+	}
+
+	private _cleanupRuntimeContext(runtime: RuntimeContext) {
+		this._cleanupTableRuntime(runtime.table);
+		runtime.viewEl.querySelectorAll<HTMLElement>('[data-cgb-collapsed]').forEach(el => el.removeAttribute('data-cgb-collapsed'));
+		runtime.viewEl.querySelectorAll<HTMLElement>('.bases-tbody').forEach(el => {
+			el.style.height = '';
+		});
+		runtime.hostEl.parentElement?.querySelector('.cgb-toolbar')?.remove();
+		runtime.viewEl.querySelectorAll('.cgb-chevron, .cgb-count-badge').forEach(el => el.remove());
+		runtime.viewEl.querySelectorAll<HTMLElement>('[data-cgb-patched],[data-cgb-container-patched],[data-cgb-initializing]').forEach(el => {
+			el.removeAttribute('data-cgb-patched');
+			el.removeAttribute('data-cgb-container-patched');
+			el.removeAttribute('data-cgb-initializing');
+			if (el.classList.contains('bases-group-heading')) el.style.cursor = '';
+		});
+		runtime.table.display?.();
+		runtime.table.updateVirtualDisplay?.();
+	}
+
+	private _getDirectRuntime(): RuntimeContext | null {
+		const leaf = this.app.workspace.activeLeaf;
+		if (!leaf || leaf.view?.getViewType?.() !== 'bases') return null;
+		const viewEl = this._getGroupedViewInLeaf(leaf);
+		const table = this._getActiveTableView();
+		const filePath = (leaf.view as { file?: TFile }).file?.path ?? this.app.workspace.getActiveFile()?.path ?? null;
+		if (!viewEl || !filePath || !this._isGroupedTableView(table, leaf)) return null;
+		return {
+			kind: 'direct',
+			hostEl: viewEl,
+			viewEl,
+			table: table as BasesTableView,
+			sourceKey: filePath,
+			getHeaders: () => Array.from(viewEl.querySelectorAll<HTMLElement>('.bases-group-heading')),
+			afterRender: () => {
+				this._fixGroupGaps(table as BasesTableView);
+			},
+		};
+	}
+
+	private _getEmbedRuntime(embedEl: HTMLElement): RuntimeContext | null {
+		const viewEl = embedEl.querySelector<HTMLElement>('.bases-view.is-grouped');
+		if (!viewEl) return null;
+		const widget = (embedEl as unknown as { cmView?: { widget?: { child?: { controller?: { _children?: unknown[] } } } } })?.cmView?.widget;
+		const children = widget?.child?.controller?._children;
+		if (!Array.isArray(children)) return null;
+		const table = children.find((c: unknown) => {
+			const m = c as BasesTableView;
+			return typeof m?.display === 'function' && Array.isArray(m?.groups) && !!m?.scrollEl;
+		}) as BasesTableView | undefined;
+		const sourceKey = embedEl.getAttribute('src');
+		if (!table || !sourceKey || !this._isGroupedTableView(table)) return null;
+		return {
+			kind: 'embed',
+			hostEl: embedEl,
+			viewEl,
+			table,
+			sourceKey,
+			getHeaders: () => Array.from(viewEl.querySelectorAll<HTMLElement>('.bases-group-heading')),
+			afterRender: () => {
+				this._fixEmbedContainerHeight(embedEl, table);
+				this._repackEmbedTables(embedEl);
+			},
+		};
+	}
+
+	private _getCanvasRuntime(canvasNodeEl: HTMLElement): RuntimeContext | null {
+		const viewEl = canvasNodeEl.querySelector<HTMLElement>('.bases-view.is-grouped');
+		if (!viewEl) return null;
+		const table = this._getCanvasTableView(canvasNodeEl);
+		const sourceKey = this._filePathForCanvasNode(canvasNodeEl);
+		if (!table || !sourceKey || !this._isGroupedTableView(table)) return null;
+		return {
+			kind: 'canvas',
+			hostEl: canvasNodeEl,
+			viewEl,
+			table,
+			sourceKey,
+			getHeaders: () => Array.from(viewEl.querySelectorAll<HTMLElement>('.bases-group-heading')),
+			afterRender: () => {
+				this._reflowCanvasNode(canvasNodeEl);
+			},
+		};
+	}
+
+	private _getActiveRuntimes(): RuntimeContext[] {
+		const leaf = this.app.workspace.activeLeaf;
+		if (!leaf) return [];
+		const type = leaf.view?.getViewType?.();
+		if (type === 'bases') {
+			const runtime = this._getDirectRuntime();
+			return runtime ? [runtime] : [];
+		}
+		if (type === 'markdown') {
+			return Array.from(leaf.view.containerEl?.querySelectorAll<HTMLElement>('.internal-embed.bases-embed') ?? [])
+				.map(embedEl => this._getEmbedRuntime(embedEl))
+				.filter((runtime): runtime is RuntimeContext => !!runtime);
+		}
+		if (type === 'canvas') {
+			return Array.from(leaf.view.containerEl?.querySelectorAll<HTMLElement>('.canvas-node') ?? [])
+				.map(nodeEl => this._getCanvasRuntime(nodeEl))
+				.filter((runtime): runtime is RuntimeContext => !!runtime);
+		}
+		return [];
+	}
+
+	private _refreshActiveRuntimes() {
+		if (!this._isGloballyEnabled()) {
+			this._removeRuntimeDomState();
+			return;
+		}
+		const runtimes = this._getActiveRuntimes();
+		if (!runtimes.length) {
+			this._removeRuntimeDomState();
+			return;
+		}
+		const hasDirectRuntime = runtimes.some(runtime => runtime.kind === 'direct');
+		if (hasDirectRuntime) this._directRefreshInFlight = true;
+		this._setInitializingState(true);
+		requestAnimationFrame(() => {
+			this._cleanupOrphanedElements();
+			for (const runtime of runtimes) {
+				this._applyCollapsedModel(runtime);
+			}
+			this._patchToolbars();
+			this._patchHeaders();
+			requestAnimationFrame(() => {
+				if (hasDirectRuntime) {
+					this._directRefreshInFlight = false;
+					this._lastDirectRefreshAt = Date.now();
+				}
+				this._setInitializingState(false);
+			});
+		});
+	}
+
+	private _shouldSkipDirectRefresh(): boolean {
+		return this._directRefreshInFlight || (Date.now() - this._lastDirectRefreshAt) < 250;
+	}
+
+	private _cleanupActiveRuntimes() {
+		for (const runtime of this._getActiveRuntimes()) {
+			this._cleanupRuntimeContext(runtime);
+		}
+		this._removeRuntimeDomState();
+		this._resetPatchedHeaderState();
+	}
+
+	private async _reloadActiveBasesLeaf(file: TFile | null) {
+		const leaf = this.app.workspace.activeLeaf;
+		if (!leaf || leaf.view?.getViewType?.() !== 'bases' || !file || this._reloadingDirectLeaf) return;
+		this._reloadingDirectLeaf = true;
+		try {
+			await (leaf as WorkspaceLeaf & { openFile?: (file: TFile) => Promise<void> | void }).openFile?.(file);
+		} finally {
+			window.setTimeout(() => {
+				this._reloadingDirectLeaf = false;
+			}, 150);
+		}
+	}
+
+	private async _rebuildManagedLeaves() {
+		for (const leaf of this._getManagedLeaves()) {
+			try {
+				await (leaf as WorkspaceLeaf & { rebuildView?: () => Promise<void> | void }).rebuildView?.();
+			} catch (error) {
+				console.error('[CGBDisable] Failed to rebuild leaf:', error);
+			}
+		}
+	}
+
+	private async _disableRuntime() {
+		if (this._patchTimer) clearTimeout(this._patchTimer);
+		if (this._refreshTimer) clearTimeout(this._refreshTimer);
+		this._rerenderingEmbed = false;
+		this._cleanupActiveRuntimes();
+		const activeFile = this.app.workspace.getActiveFile();
+		if (activeFile?.path.endsWith('.base')) {
+			await this._reloadActiveBasesLeaf(activeFile);
+		}
+	}
+
 	async onload() {
 		await this.loadSettings();
 		await this._loadFoldState();
-		for (const key of Object.keys(this._foldState)) this._collapsedKeys.add(key);
+		this._syncCollapsedKeysFromFoldState();
 
 		// Initialize base config manager
 		this._baseConfigManager = new BaseConfigManager(this.app);
@@ -88,7 +373,7 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 			name: 'Collapse all groups in current Bases view',
 			checkCallback: (checking: boolean) => {
 				const resolved = this._getResolvedSettings();
-				const ok = resolved.enableCollapsibleGroups && !!this._getActiveTableView();
+				const ok = resolved.enableCollapsibleGroups && this._isActiveGroupedBasesView() && !!this._getActiveTableView();
 				if (!checking && ok) this._collapseAll();
 				return ok;
 			},
@@ -98,7 +383,7 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 			name: 'Expand all groups in current Bases view',
 			checkCallback: (checking: boolean) => {
 				const resolved = this._getResolvedSettings();
-				const ok = resolved.enableCollapsibleGroups && !!this._getActiveTableView();
+				const ok = resolved.enableCollapsibleGroups && this._isActiveGroupedBasesView() && !!this._getActiveTableView();
 				if (!checking && ok) this._expandAll();
 				return ok;
 			},
@@ -107,24 +392,36 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 
 
 		this.app.workspace.onLayoutReady(() => {
+			if (!this._isGloballyEnabled()) {
+				this._cleanupActiveRuntimes();
+				return;
+			}
 			// Clear stale per-element flags from previous plugin loads
 			document.querySelectorAll('.internal-embed.bases-embed').forEach(el => {
 				delete (el as HTMLElement & { __cgbModelApplied?: boolean }).__cgbModelApplied;
 				delete (el as HTMLElement & { __cgbVisibilityWatched?: boolean }).__cgbVisibilityWatched;
 			});
-			this._refreshAllGroupedViews();
+			if (this.app.workspace.activeLeaf?.view?.getViewType?.() === 'bases') this._refreshActiveRuntimes();
+			else if (this.app.workspace.activeLeaf?.view?.getViewType?.() === 'markdown') this._refreshEmbeddedInActiveLeaf();
+			else if (this.app.workspace.activeLeaf?.view?.getViewType?.() === 'canvas') this._refreshCanvasLeaf();
 		});
 
 		// Listen for view opens to refresh when switching to grouped views
 		// Hide the active grouped view immediately, then restore after config/state is applied.
 		this.app.workspace.on('active-leaf-change', () => {
+			if (!this._isGloballyEnabled()) {
+				this._setInitializingState(false);
+				this._cleanupActiveRuntimes();
+				return;
+			}
 			if (this._patchTimer) clearTimeout(this._patchTimer);
 			if (this._refreshTimer) clearTimeout(this._refreshTimer);
 			this._setInitializingState(true);
 			this._patchTimer = setTimeout(async () => {
 				await this._loadBaseConfig();
-				if (this._getActiveTableView()) {
-					this._refreshAllGroupedViews();
+				const leafType = this.app.workspace.activeLeaf?.view?.getViewType?.();
+				if (leafType === 'bases' && this._getDirectRuntime()) {
+					this._refreshActiveRuntimes();
 				} else {
 					this._setInitializingState(false);
 					// Clear per-embed flags so fresh patching runs on this leaf
@@ -142,6 +439,25 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 				}
 			}, 120);
 		});
+
+		this.registerEvent(this.app.workspace.on('file-open', (file) => {
+			window.setTimeout(async () => {
+				if (!this._isGloballyEnabled()) {
+					this._cleanupActiveRuntimes();
+					return;
+				}
+				await this._loadBaseConfig();
+				const leafType = this.app.workspace.activeLeaf?.view?.getViewType?.();
+				if (leafType === 'bases' && file?.path.endsWith('.base') && !this._isActiveGroupedBasesView()) {
+					this._cleanupActiveRuntimes();
+					await this._reloadActiveBasesLeaf(file);
+					return;
+				}
+				if (leafType === 'bases') this._refreshActiveRuntimes();
+				else if (leafType === 'markdown') this._refreshEmbeddedInActiveLeaf();
+				else if (leafType === 'canvas') this._refreshCanvasLeaf();
+			}, 60);
+		}));
 
 		// Watch for embedded bases appearing in the DOM
 		this._setupEmbedObserver();
@@ -191,6 +507,7 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 	private _setupEmbedObserver() {
 		if (this._embedObserver) return;
 		this._embedObserver = new MutationObserver((mutations) => {
+			if (!this._isGloballyEnabled()) return;
 			let hasNewGroupedView = false;
 			let hasNewEmbed = false;
 			for (const mutation of mutations) {
@@ -226,13 +543,13 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 			if (hasNewGroupedView) {
 				if (this._refreshTimer) clearTimeout(this._refreshTimer);
 				this._refreshTimer = setTimeout(() => {
-					if (this._getActiveTableView()) {
-						this._refreshAllGroupedViews();
-					} else {
-						// Canvas or other view with embedded grouped bases
-						this._patchToolbars();
-						this._patchHeaders();
-					}
+					const leafType = this.app.workspace.activeLeaf?.view?.getViewType?.();
+					if (leafType === 'bases' && this._getDirectRuntime()) {
+						if (this._shouldSkipDirectRefresh()) return;
+						this._refreshActiveRuntimes();
+					} else if (leafType === 'markdown') this._refreshEmbeddedInActiveLeaf();
+					else if (leafType === 'canvas') this._refreshCanvasLeaf();
+					else this._cleanupActiveRuntimes();
 				}, 100);
 			}
 			if (hasNewEmbed) {
@@ -251,12 +568,12 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 	}
 
 	private _refreshCanvasLeaf() {
+		if (!this._isRuntimeEnabled()) return;
 		const leaf = this.app.workspace.activeLeaf;
 		if (!leaf) return;
 		if (leaf.view?.getViewType() !== 'canvas') return;
 		this._patchToolbars();
 		this._patchHeaders();
-		// Find all canvas nodes with Bases embeds and apply collapse state
 		const canvasNodeEls = leaf.view.containerEl.querySelectorAll<HTMLElement>('.canvas-node');
 		canvasNodeEls.forEach(el => {
 			if (el.querySelector('.bases-view.is-grouped')) {
@@ -266,6 +583,7 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 	}
 
 	private _refreshEmbeddedInActiveLeaf() {
+		if (!this._isRuntimeEnabled()) return;
 		if (this._rerenderingEmbed) return;
 		const leaf = this.app.workspace.activeLeaf;
 		if (!leaf) return;
@@ -273,15 +591,11 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 		if (!container) return;
 		const embedEls = container.querySelectorAll<HTMLElement>('.internal-embed.bases-embed');
 		if (!embedEls.length) return;
-		// Patch toolbars for all grouped views in document (covers embeds too)
 		this._patchToolbars();
 		embedEls.forEach(embedEl => {
 			this._patchEmbedHeaders(embedEl);
 			this._applyEmbedCollapse(embedEl);
-			// Watch for embed scrolling into view so Bases can render all rows
 			this._watchEmbedVisibility(embedEl);
-			// Apply data model if not yet done for this embed instance.
-			// Use a flag rather than header-patched check to avoid race conditions.
 			const notYetInitialized = !(embedEl as HTMLElement & { __cgbModelApplied?: boolean }).__cgbModelApplied;
 			if (notYetInitialized && !this._rerenderingEmbed) {
 				(embedEl as HTMLElement & { __cgbModelApplied?: boolean }).__cgbModelApplied = true;
@@ -489,17 +803,99 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 		});
 	}
 
-	private _refreshAllGroupedViews() {
-		this._setInitializingState(true);
-		requestAnimationFrame(() => {
-			this._cleanupOrphanedElements();
-			this._applyCollapsedModelToActiveTable();
-			this._patchToolbars();
-			this._patchHeaders();
+	private _ensureRuntimeUpdateWrapper(runtime: RuntimeContext) {
+		const table = runtime.table;
+		const mode = `${runtime.kind}:${runtime.sourceKey}`;
+		if (table.__cgbWrappedMode === mode && table.__cgbOriginalUpdateVirtualDisplay) return;
+		const original = table.__cgbOriginalUpdateVirtualDisplay ?? table.updateVirtualDisplay?.bind(table);
+		if (!original) return;
+		table.__cgbOriginalUpdateVirtualDisplay = original;
+		table.__cgbWrappedMode = mode;
+		table.updateVirtualDisplay = (() => {
+			if (table.data && this._isGloballyEnabled()) {
+				table.data.groupedDataCache = this._buildCollapsedGroups(table, runtime.sourceKey, this._getResolvedSettings());
+			}
+			const result = table.__cgbOriginalUpdateVirtualDisplay?.();
+			runtime.afterRender();
+			if (runtime.kind !== 'direct') {
+				this._patchToolbars();
+				this._patchHeaders();
+			}
+			return result;
+		}) as () => void;
+	}
+
+	private _applyCollapsedModel(runtime: RuntimeContext) {
+		const resolved = this._getResolvedSettings();
+		if (!resolved.enableCollapsibleGroups) {
+			this._cleanupRuntimeContext(runtime);
+			return;
+		}
+		if (!this._isGroupedTableView(runtime.table)) {
+			this._cleanupRuntimeContext(runtime);
+			return;
+		}
+		this._ensureRuntimeUpdateWrapper(runtime);
+		if (!runtime.table.data) return;
+		runtime.table.data.groupedDataCache = this._buildCollapsedGroups(runtime.table, runtime.sourceKey, resolved);
+		runtime.table.display?.();
+		runtime.table.updateVirtualDisplay?.();
+		this._syncRuntimeDom(runtime, resolved);
+	}
+
+	private _syncRuntimeDom(runtime: RuntimeContext, resolved: ResolvedConfig) {
+		this._applyCollapsedDomState(runtime, resolved);
+		runtime.afterRender();
+		if (runtime.kind === 'direct') {
 			requestAnimationFrame(() => {
-				this._setInitializingState(false);
+				this._applyCollapsedDomState(runtime, resolved);
+				runtime.afterRender();
 			});
-		});
+		}
+	}
+
+	private _applyCollapsedDomState(runtime: RuntimeContext, resolved: ResolvedConfig) {
+		const headers = runtime.getHeaders();
+		for (const header of headers) {
+			const groupValue = this._normalizeGroupValue(header.querySelector('.bases-group-value')?.textContent?.trim());
+			const key = `${runtime.sourceKey}::${groupValue}`;
+			const collapsed = resolved.enableCollapsibleGroups && (resolved.collapseAllByDefault || this._collapsedKeys.has(key));
+			const tableEl = header.closest('.bases-table') as HTMLElement | null;
+			if (tableEl) {
+				if (collapsed) tableEl.setAttribute('data-cgb-collapsed', 'true');
+				else tableEl.removeAttribute('data-cgb-collapsed');
+				const tbody = tableEl.querySelector<HTMLElement>(':scope > .bases-tbody');
+				if (tbody) {
+					if (collapsed) {
+						tbody.style.height = '0px';
+					} else if (runtime.kind === 'direct') {
+						const groupCount = this._groupEntryCount(runtime.table, groupValue);
+						tbody.style.height = `${this._groupRowHeight(tbody) * groupCount}px`;
+					} else {
+						tbody.style.height = '';
+					}
+				}
+			}
+		}
+	}
+
+	private _groupEntryCount(table: BasesTableView, groupValue: string): number {
+		const countMap = table.__cgbGroupCountMap ?? {};
+		if (groupValue in countMap) return countMap[groupValue] ?? 0;
+		const original = table.__cgbOriginalGroupedData ?? [];
+		const group = original.find(item => this._normalizeGroupValue(this._groupValue(item)) === groupValue);
+		return group?.entries.length ?? 0;
+	}
+
+	private _groupRowHeight(tbody: HTMLElement): number {
+		const computed = getComputedStyle(tbody);
+		const cssValue = computed.getPropertyValue('--bases-table-row-height').trim();
+		const parsed = parseFloat(cssValue);
+		return Number.isFinite(parsed) && parsed > 0 ? parsed : 30;
+	}
+
+	private _refreshAllGroupedViews() {
+		this._refreshActiveRuntimes();
 	}
 
 	private _setInitializingState(initializing: boolean) {
@@ -549,6 +945,10 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 	}
 
 	private _patchToolbars() {
+		if (!this._isRuntimeEnabled()) {
+			document.querySelectorAll('.cgb-toolbar').forEach(el => el.remove());
+			return;
+		}
 		const resolved = this._getResolvedSettings();
 		if (!resolved.showToolbarButtons) {
 			document.querySelectorAll('.cgb-toolbar').forEach(el => el.remove());
@@ -644,7 +1044,7 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 	}
 
 	private _patchHeaders() {
-		if (!this._getResolvedSettings().enableCollapsibleGroups) return;
+		if (!this._isRuntimeEnabled()) return;
 		// Patch all headers that are currently in the DOM
 		const allHeaders = document.querySelectorAll<HTMLElement>('.bases-group-heading');
 		const headerCount = allHeaders.length;
@@ -660,7 +1060,7 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 			}
 			if (allAlreadyPatched) {
 				// Just sync UI state without full patch - and skip badges if not showing
-				if (this.settings.showGroupCounts) {
+				if (this._getResolvedSettings().showGroupCounts) {
 					for (let i = 0; i < headerCount; i++) {
 						this._updateBadgeQuick(allHeaders[i]);
 					}
@@ -676,6 +1076,7 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 	}
 
 	private _patchHeader(header: HTMLElement) {
+		if (!this._isRuntimeEnabled()) return;
 		// Check if already patched (accounts for virtual scroll element reuse)
 		const existingChevron = header.querySelector('.cgb-chevron');
 		if (existingChevron) {
@@ -783,7 +1184,7 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 
 	private _toggle(header: HTMLElement) {
 		const resolved = this._getResolvedSettings();
-		if (!resolved.enableCollapsibleGroups) return;
+		if (!this._isRuntimeEnabled() || !resolved.enableCollapsibleGroups) return;
 
 		// Canvas node: skip toggle on first click (canvas focuses the node)
 		const canvasNodeEl = header.closest('.canvas-node') as HTMLElement | null;
@@ -802,7 +1203,6 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 			this._applyEmbedCollapse(embedEl);
 			this._syncHeaderUi(header);
 			this._applyCollapsedModelToEmbed(embedEl);
-			requestAnimationFrame(() => { this._repackEmbedTables(embedEl); });
 			return;
 		}
 
@@ -915,10 +1315,12 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 		table.display?.();
 		table.updateVirtualDisplay?.();
 		this._fixGroupGaps(table);
+		this._reflowCanvasNode(canvasNodeEl);
 		this._installGapFixer(table);
 
 		// Re-patch headers after display() re-creates them
 		requestAnimationFrame(() => {
+			this._reflowCanvasNode(canvasNodeEl);
 			this._patchHeaders();
 			this._patchToolbars();
 		});
@@ -933,12 +1335,8 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 		let top = 0;
 		for (let i = 0; i < tables.length; i++) {
 			const t = tables[i];
-			const hdr = t.querySelector<HTMLElement>(':scope > .bases-group-heading');
-			const tbody = t.querySelector<HTMLElement>(':scope > .bases-tbody');
-			const headerH = hdr?.offsetHeight ?? 40;
-			const bodyH = tbody && getComputedStyle(tbody).display !== 'none' ? (tbody.offsetHeight || 0) : 0;
 			t.style.top = `${top}px`;
-			top += headerH + bodyH;
+			top += t.getBoundingClientRect().height || 0;
 		}
 		tableContainer.style.height = `${top}px`;
 	}
@@ -1156,16 +1554,16 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 
 	private _collapseAll() {
 		const resolved = this._getResolvedSettings();
-		const table = this._getActiveTableView();
-		if (!table) return;
+		const runtime = this._getDirectRuntime();
+		if (!runtime) return;
 
 		// Clear the cached original data to force re-fetch from source
-		delete table.__cgbOriginalGroupedData;
-		delete table.__cgbGroupCountMap;
+		delete runtime.table.__cgbOriginalGroupedData;
+		delete runtime.table.__cgbGroupCountMap;
 
 		// Use DOM to find ALL group headers, not just those in the virtual data
 		// This ensures we collapse all groups even with virtual scrolling
-		const headers = document.querySelectorAll<HTMLElement>('.bases-group-heading');
+		const headers = runtime.getHeaders();
 		let changed = false;
 
 		for (let i = 0; i < headers.length; i++) {
@@ -1182,7 +1580,7 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 			this._saveFoldState();
 			// Use batched RAF for UI update
 			requestAnimationFrame(() => {
-				this._applyCollapsedModelToActiveTable();
+				this._applyCollapsedModel(runtime);
 				this._patchHeaders();
 				this._scrollActiveViewToTop();
 			});
@@ -1191,16 +1589,16 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 
 	private _expandAll() {
 		const resolved = this._getResolvedSettings();
-		const table = this._getActiveTableView();
-		if (!table) return;
+		const runtime = this._getDirectRuntime();
+		if (!runtime) return;
 
 		// Clear the cached original data to force re-fetch from source
-		delete table.__cgbOriginalGroupedData;
-		delete table.__cgbGroupCountMap;
+		delete runtime.table.__cgbOriginalGroupedData;
+		delete runtime.table.__cgbGroupCountMap;
 
 		// Use DOM to find ALL group headers, not just those in the virtual data
 		// This ensures we expand all groups even with virtual scrolling
-		const headers = document.querySelectorAll<HTMLElement>('.bases-group-heading');
+		const headers = runtime.getHeaders();
 		let changed = false;
 
 		for (let i = 0; i < headers.length; i++) {
@@ -1217,7 +1615,7 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 			this._saveFoldState();
 			// Use batched RAF for UI update
 			requestAnimationFrame(() => {
-				this._applyCollapsedModelToActiveTable();
+				this._applyCollapsedModel(runtime);
 				this._patchHeaders();
 				this._scrollActiveViewToTop();
 			});
@@ -1225,9 +1623,11 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 	}
 
 	private _refreshAfterStateChange(expandedKey?: string) {
+		const runtime = this._getDirectRuntime();
+		if (!runtime) return;
 		const table = this._getActiveTableView();
 		const previousScrollTop = table?.scrollEl?.scrollTop ?? 0;
-		this._applyCollapsedModelToActiveTable();
+		this._applyCollapsedModel(runtime);
 		this._patchHeaders();
 
 		if (expandedKey) {
@@ -1240,25 +1640,9 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 	}
 
 	private _applyCollapsedModelToActiveTable() {
-		const resolved = this._getResolvedSettings();
-		if (!resolved.enableCollapsibleGroups) return;
-		const table = this._getActiveTableView();
-		const data = table?.data;
-		if (!table || !data) return;
-
-		const original = this._getOriginalGroupedData(table);
-		data.groupedDataCache = original.map(group => {
-			const clone = { ...group } as BasesGroup;
-			const key = this._stateKey(this._groupValue(group));
-			const collapsed = resolved.enableCollapsibleGroups && (resolved.collapseAllByDefault || this._collapsedKeys.has(key));
-			clone.entries = collapsed ? [] : group.entries.slice();
-			return clone;
-		});
-
-		table.display?.();
-		table.updateVirtualDisplay?.();
-		this._fixGroupGaps(table);
-		this._installGapFixer(table);
+		const runtime = this._getDirectRuntime();
+		if (!runtime) return;
+		this._applyCollapsedModel(runtime);
 	}
 
 	private _installGapFixer(table: BasesTableView) {
@@ -1270,32 +1654,35 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 		const self = this;
 		(table as unknown as Record<string, unknown>).updateVirtualDisplay = function(this: BasesTableView) {
 			const result = original();
-			self._fixGroupGaps(this);
+			requestAnimationFrame(() => {
+				self._fixGroupGaps(this);
+			});
 			return result;
 		};
 	}
 
 	private _fixGroupGaps(table: BasesTableView) {
-		// After updateVirtualDisplay, Bases has positioned tables with --bases-table-group-gap
-		// between each group. Recompute top values without the gap for compact collapsed layout.
 		const container = table.containerEl;
 		if (!container) return;
 		const tables = container.querySelectorAll<HTMLElement>(':scope > .bases-table');
+		this._repackTablesByMeasuredHeight(container, tables);
+	}
+
+	private _repackTablesByMeasuredHeight(container: HTMLElement, tables: NodeListOf<HTMLElement> | HTMLElement[]) {
 		let top = 0;
 		for (let i = 0; i < tables.length; i++) {
-			const t = tables[i];
-			t.style.top = `${top}px`;
-			// Height = header height (from BCR) + tbody height (from inline style, 0 for collapsed)
-			const heading = t.querySelector<HTMLElement>(':scope > .bases-group-heading');
-			const tbody = t.querySelector<HTMLElement>(':scope > .bases-tbody');
-			const headingH = heading ? heading.getBoundingClientRect().height : 30;
-			const tbodyH = tbody ? parseInt(tbody.style.height || '0', 10) : 0;
-			top += headingH + tbodyH;
+			const tableEl = tables[i];
+			tableEl.style.top = `${top}px`;
+			const measuredHeight = tableEl.getBoundingClientRect().height;
+			if (measuredHeight > 0) {
+				top += measuredHeight;
+				continue;
+			}
+			const heading = tableEl.querySelector<HTMLElement>(':scope > .bases-group-heading');
+			const tbody = tableEl.querySelector<HTMLElement>(':scope > .bases-tbody');
+			top += (heading?.getBoundingClientRect().height ?? 30) + (tbody?.getBoundingClientRect().height ?? 0);
 		}
-		// Update container height to match
-		if (container.parentElement) {
-			container.style.height = `${top}px`;
-		}
+		container.style.height = `${top}px`;
 	}
 
 	private _resetGroupedDataCache() {
@@ -1328,6 +1715,9 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 		if (needsRefresh) {
 			table.__cgbOriginalGroupedData = source;
 			table.__cgbGroupCountMap = Object.fromEntries(source.map(group => [this._groupValue(group), group.entries.length]));
+		} else if (!table.__cgbGroupCountMap) {
+			const countSource = table.__cgbOriginalGroupedData ?? source;
+			table.__cgbGroupCountMap = Object.fromEntries(countSource.map(group => [this._groupValue(group), group.entries.length]));
 		}
 
 		return table.__cgbOriginalGroupedData ?? source;
@@ -1563,82 +1953,10 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 		await this.saveData(data);
 		// Mark cache as dirty since global settings changed
 		this._baseConfigCacheDirty = true;
-		// If collapsible groups disabled, clean up all plugin DOM state
 		if (!this.settings.enableCollapsibleGroups) {
-			this._collapsedKeys.clear();
-			document.querySelectorAll('.cgb-chevron').forEach(el => el.remove());
-			document.querySelectorAll('[data-cgb-patched]').forEach(el => {
-				el.removeAttribute('data-cgb-patched');
-				(el as HTMLElement).style.cursor = '';
-			});
-			// Remove collapse attributes and restore tbody heights so records show again
-			document.querySelectorAll('[data-cgb-collapsed]').forEach(el => {
-				el.removeAttribute('data-cgb-collapsed');
-				const tbody = el.querySelector<HTMLElement>(':scope > .bases-tbody');
-				if (tbody) tbody.style.height = '';
-			});
-			// Restore groupedData from __cgbOriginalGroupedData so all rows reappear
-			// (groupedData === groupedDataCache same object, so restoring one restores both)
-			document.querySelectorAll<HTMLElement>('.bases-view.is-grouped').forEach(view => {
-				const widget = ('widget' in view ? (view as unknown as { widget?: { _children?: unknown[] } }).widget?._children : null) ||
-					(view as unknown as { __cmWidget?: { child?: { controller?: { _children?: unknown[] } } } }).__cmWidget?.child?.controller?._children;
-				if (!Array.isArray(widget)) return;
-				const table = widget.find((c: unknown) => {
-					const m = c as BasesTableView;
-					return typeof m?.display === 'function' && m?.data?.groupedData;
-				}) as BasesTableView | undefined;
-				if (table?.__cgbOriginalGroupedData && table.data) {
-					// Restore groupedData from original so all rows are visible
-					table.data.groupedData = table.__cgbOriginalGroupedData.map(g => ({
-						...g,
-						entries: (g as BasesGroup & { entries?: unknown[] }).entries?.slice() ?? [],
-					})) as BasesGroup[];
-					delete table.__cgbOriginalGroupedData;
-				}
-				if (table) {
-					delete (table as BasesTableView & { updateVirtualDisplay?: unknown }).updateVirtualDisplay;
-					delete (table as unknown as Record<string, unknown>).__cgbUpdateGuard;
-					delete (table as unknown as Record<string, unknown>).__cgbGapFixerInstalled;
-					table.display?.();
-					table.updateVirtualDisplay?.();
-				}
-			});
-			// Restore active table
-			const activeTable = this._getActiveTableView();
-			if (activeTable?.__cgbOriginalGroupedData && activeTable.data) {
-				activeTable.data.groupedData = activeTable.__cgbOriginalGroupedData.map(g => ({
-					...g,
-					entries: (g as BasesGroup & { entries?: unknown[] }).entries?.slice() ?? [],
-				})) as BasesGroup[];
-				delete activeTable.__cgbOriginalGroupedData;
-				activeTable.display?.();
-				activeTable.updateVirtualDisplay?.();
-			}
-			// Remove embed guards too
-			document.querySelectorAll<HTMLElement>('.internal-embed.bases-embed').forEach(embedEl => {
-				const widget = (embedEl as unknown as { cmView?: { widget?: { child?: { controller?: { _children?: unknown[] } } } } })?.cmView?.widget;
-				const children = widget?.child?.controller?._children;
-				if (!Array.isArray(children)) return;
-				const table = children.find((c: unknown) => {
-					const m = c as BasesTableView;
-					return typeof m?.display === 'function' && Array.isArray(m?.groups);
-				}) as BasesTableView | undefined;
-				if (!table) return;
-				if (table.__cgbOriginalGroupedData && table.data) {
-					table.data.groupedData = table.__cgbOriginalGroupedData.map(g => ({
-						...g,
-						entries: (g as BasesGroup & { entries?: unknown[] }).entries?.slice() ?? [],
-					})) as BasesGroup[];
-					delete table.__cgbOriginalGroupedData;
-				}
-				delete (table as BasesTableView & { updateVirtualDisplay?: unknown }).updateVirtualDisplay;
-				delete (table as unknown as Record<string, unknown>).__cgbUpdateGuard;
-				delete (table as unknown as Record<string, unknown>).__cgbGapFixerInstalled;
-				table.display?.();
-				table.updateVirtualDisplay?.();
-			});
-			this._patchedHeaders.clear();
-			this._headerKeyCache.clear();
+			await this._disableRuntime();
+		} else {
+			this._syncCollapsedKeysFromFoldState();
 		}
 	}
 
@@ -1674,7 +1992,7 @@ class CgbSettingTab extends PluginSettingTab {
 				toggle.setValue(this.plugin.settings.showToolbarButtons).onChange(async value => {
 					this.plugin.settings.showToolbarButtons = value;
 					await this.plugin.saveSettings();
-					(this.plugin as unknown as { _refreshAllGroupedViews: () => void })._refreshAllGroupedViews();
+					(this.plugin as unknown as { _refreshActiveRuntimes: () => void })._refreshActiveRuntimes();
 				}),
 			);
 
@@ -1690,7 +2008,7 @@ class CgbSettingTab extends PluginSettingTab {
 					.onChange(async value => {
 						this.plugin.settings.toolbarButtonDisplay = value as 'icon' | 'text' | 'both';
 						await this.plugin.saveSettings();
-						(this.plugin as unknown as { _refreshAllGroupedViews: () => void })._refreshAllGroupedViews();
+						(this.plugin as unknown as { _refreshActiveRuntimes: () => void })._refreshActiveRuntimes();
 					}),
 			);
 
@@ -1704,7 +2022,7 @@ class CgbSettingTab extends PluginSettingTab {
 					this.plugin.settings.enableCollapsibleGroups = value;
 					await this.plugin.saveSettings();
 					if (value) {
-						(this.plugin as unknown as { _refreshAllGroupedViews: () => void })._refreshAllGroupedViews();
+						(this.plugin as unknown as { _refreshActiveRuntimes: () => void })._refreshActiveRuntimes();
 					}
 					// When disabling: saveSettings already removed chevrons; don't re-patch
 				}),
@@ -1729,7 +2047,7 @@ class CgbSettingTab extends PluginSettingTab {
 				toggle.setValue(this.plugin.settings.showGroupCounts).onChange(async value => {
 					this.plugin.settings.showGroupCounts = value;
 					await this.plugin.saveSettings();
-					(this.plugin as unknown as { _refreshAllGroupedViews: () => void })._refreshAllGroupedViews();
+					(this.plugin as unknown as { _refreshActiveRuntimes: () => void })._refreshActiveRuntimes();
 				}),
 			);
 
