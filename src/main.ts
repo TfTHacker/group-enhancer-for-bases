@@ -164,9 +164,8 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 
 	private _cleanupTableRuntime(table: BasesTableView | null | undefined) {
 		if (!table) return;
-		if (table.__cgbOriginalUpdateVirtualDisplay) {
-			table.updateVirtualDisplay = table.__cgbOriginalUpdateVirtualDisplay;
-		}
+		const nativeUpdateVirtualDisplay = this._getNativeUpdateVirtualDisplay(table);
+		if (nativeUpdateVirtualDisplay) table.updateVirtualDisplay = nativeUpdateVirtualDisplay;
 		table.__cgbOriginalUpdateVirtualDisplay = null;
 		table.__cgbWrappedMode = null;
 		if (table.data) {
@@ -175,6 +174,12 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 		delete table.__cgbOriginalGroupedData;
 		delete table.__cgbGroupCountMap;
 		delete table.__cgbGapFixerInstalled;
+	}
+
+	private _getNativeUpdateVirtualDisplay(table: BasesTableView): (() => void) | null {
+		const protoUpdate = Object.getPrototypeOf(table)?.updateVirtualDisplay;
+		if (typeof protoUpdate === 'function') return protoUpdate.bind(table) as () => void;
+		return table.__cgbOriginalUpdateVirtualDisplay ?? table.updateVirtualDisplay?.bind(table) ?? null;
 	}
 
 	private _cleanupRuntimeContext(runtime: RuntimeContext) {
@@ -807,7 +812,7 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 		const table = runtime.table;
 		const mode = `${runtime.kind}:${runtime.sourceKey}`;
 		if (table.__cgbWrappedMode === mode && table.__cgbOriginalUpdateVirtualDisplay) return;
-		const original = table.__cgbOriginalUpdateVirtualDisplay ?? table.updateVirtualDisplay?.bind(table);
+		const original = table.__cgbOriginalUpdateVirtualDisplay ?? this._getNativeUpdateVirtualDisplay(table);
 		if (!original) return;
 		table.__cgbOriginalUpdateVirtualDisplay = original;
 		table.__cgbWrappedMode = mode;
@@ -1290,8 +1295,9 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 	private _applyCollapsedModelToCanvasNode(canvasNodeEl: HTMLElement) {
 		const resolved = this._getResolvedSettings();
 		const filePath = this._filePathForCanvasNode(canvasNodeEl) ?? '';
+		const runtime = this._getCanvasRuntime(canvasNodeEl);
 
-		const table = this._getCanvasTableView(canvasNodeEl);
+		const table = runtime?.table ?? this._getCanvasTableView(canvasNodeEl);
 		if (!table?.data) return;
 
 		if (!table.__cgbOriginalGroupedData) {
@@ -1312,11 +1318,10 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 			return clone;
 		});
 
+		if (runtime) this._ensureRuntimeUpdateWrapper(runtime);
 		table.display?.();
 		table.updateVirtualDisplay?.();
-		this._fixGroupGaps(table);
 		this._reflowCanvasNode(canvasNodeEl);
-		this._installGapFixer(table);
 
 		// Re-patch headers after display() re-creates them
 		requestAnimationFrame(() => {
@@ -1332,13 +1337,7 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 		const tableContainer = container.querySelector<HTMLElement>('.bases-table-container');
 		if (!tableContainer) return;
 		const tables = tableContainer.querySelectorAll<HTMLElement>(':scope > .bases-table');
-		let top = 0;
-		for (let i = 0; i < tables.length; i++) {
-			const t = tables[i];
-			t.style.top = `${top}px`;
-			top += t.getBoundingClientRect().height || 0;
-		}
-		tableContainer.style.height = `${top}px`;
+		this._repackTablesByMeasuredHeight(tableContainer, tables);
 	}
 
 	private _applyCollapsedModelToEmbed(embedEl: HTMLElement) {
@@ -1673,7 +1672,7 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 		for (let i = 0; i < tables.length; i++) {
 			const tableEl = tables[i];
 			tableEl.style.top = `${top}px`;
-			const measuredHeight = tableEl.getBoundingClientRect().height;
+			const measuredHeight = tableEl.offsetHeight || tableEl.getBoundingClientRect().height;
 			if (measuredHeight > 0) {
 				top += measuredHeight;
 				continue;
