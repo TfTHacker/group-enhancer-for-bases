@@ -7,7 +7,7 @@
 Run `npm install` once to install TypeScript and bundling dependencies.
 
 - `npm run dev`: builds with inline sourcemaps for local iteration.
-- `npm run build`: runs `tsc -noEmit -skipLibCheck` and then produces the production bundle.
+- `npm run build`: runs `node node_modules/typescript/lib/tsc.js -noEmit -skipLibCheck` and then produces the production bundle.
 - `npm run version`: bumps `manifest.json` and `versions.json` for a release-ready version update.
 
 There is no dedicated test runner configured today, so `npm run build` is the main verification step.
@@ -23,3 +23,15 @@ The current history uses short, imperative commit subjects such as `Initial dist
 
 ## Release & Configuration Notes
 Treat `manifest.json`, `versions.json`, and `main.js` as release artifacts that must stay in sync. Changes to `.base` parsing should preserve existing user content and fail safely when metadata is missing or malformed.
+
+GitHub Releases are created by [`.github/workflows/release.yml`](/srv/shared_data/dev/group-enhancer-for-bases/.github/workflows/release.yml) when a plain `x.y.z` tag is pushed. The verified release flow for this repo is:
+
+1. Ensure the working tree is clean with `git status`.
+2. If `git push origin main` would be non-fast-forward, run `git fetch origin` and `git rebase origin/main` first. If conflicts occur, resolve them, `git add` the resolved files, and continue with `GIT_EDITOR=true git rebase --continue`.
+3. Run `npm version patch` or `npm version minor` or `npm version major`.
+4. Verify `package.json`, `manifest.json`, and `versions.json` all have the same version.
+5. Important: `npm version` currently creates a `vX.Y.Z` tag by default, but the workflow only matches plain `X.Y.Z`. Replace the tag before pushing, for example `git tag -d v0.1.1 && git tag 0.1.1 HEAD`.
+6. Push the branch with `git push origin main`.
+7. Push the plain release tag with `git push origin 0.1.1`.
+
+The release workflow publishes `main.js`, `manifest.json`, and `styles.css`. Do not push a `v`-prefixed tag for releases unless the workflow is updated to accept it.
