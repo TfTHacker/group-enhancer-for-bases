@@ -16,7 +16,7 @@ There is no dedicated test runner configured today, so `npm run build` is the ma
 The codebase uses TypeScript with tabs for indentation and single quotes in source files. Follow the existing naming patterns: PascalCase for classes and interfaces (`BaseConfigManager`), camelCase for functions and variables, and leading underscores for internal plugin methods and fields (`_loadBaseConfig`, `_foldState`). Keep modules small and focused on one concern. Prefer explicit types when interacting with Obsidian internals or DOM-derived data.
 
 ## Testing Guidelines
-No automated tests are checked in yet. For each change, run `npm run build` and manually verify behavior in Obsidian against a grouped Bases view. Test both global settings and `.base`-level overrides when touching configuration logic. If you add tests later, place them near the source they cover or under a new `test/` directory and name them after the module under test.
+Run `npm test` and `npm run build` for code changes. Then manually verify behavior in Obsidian against a grouped Bases view. Test both global settings and `.base`-level overrides when touching configuration logic. Keep automated tests under `test/`, and use `test/manual-checklist.md` for live verification coverage.
 
 ## Commit & Pull Request Guidelines
 The current history uses short, imperative commit subjects such as `Initial distribution-ready snapshot`. Keep commits focused and descriptive, for example `Add view-level toolbar toggle`. Pull requests should include a brief summary, manual verification notes, linked issues when applicable, and updated screenshots when UI behavior changes.
@@ -35,3 +35,10 @@ GitHub Releases are created by [`.github/workflows/release.yml`](/srv/shared_dat
 7. Push the plain release tag with `git push origin 0.1.1`.
 
 The release workflow publishes `main.js`, `manifest.json`, and `styles.css`. Do not push a `v`-prefixed tag for releases unless the workflow is updated to accept it.
+
+## Repo-Specific Bases Notes
+- Treat direct `.base` views, markdown embeds, and canvas nodes as separate runtime paths. Verify fixes in each relevant runtime.
+- Markdown leaves can retain stale hidden `.internal-embed.bases-embed` nodes. When inspecting or patching embeds, only treat renderable visible embeds as active runtimes.
+- For grouped Bases bugs, compare live host state such as `groupedData`, `groupedDataCache`, and runtime/controller state before assuming the issue is CSS-only.
+- `TestingVault` is the primary live verification environment for this repo. Useful fixtures include `Sample 1.base`, `Sample 2.base`, `embed 2.md`, and `My Tasks.base`.
+- Release prep in this repo may mention the next version in `CHANGELOG.md` before `package.json`, `manifest.json`, and `versions.json` are bumped by the release process.
