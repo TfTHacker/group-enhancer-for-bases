@@ -1,23 +1,36 @@
 import { App, Notice, Plugin, PluginSettingTab, Setting, TFile, WorkspaceLeaf, setIcon } from 'obsidian';
 import { BaseConfigManager, BaseGroupEnhancerConfig } from './base-config';
 import { ConfigResolver, ResolvedConfig } from './config-resolver';
+import { clearDragDomState, syncDragDecorations } from './drag-dom';
+import { applyMobileResolvedOverrides, isFeatureEnabledOnCurrentDevice } from './feature-gates';
+import { getWritableGroupField, WritableGroupField } from './group-field';
 
 interface CgbSettings {
 	enableCollapsibleGroups: boolean;
+	enableCollapsibleGroupsMobile: boolean;
 	rememberFoldState: boolean;
 	collapseAllByDefault: boolean;
 	showToolbarButtons: boolean;
+	showToolbarButtonsMobile: boolean;
 	toolbarButtonDisplay: 'icon' | 'text' | 'both';
 	showGroupCounts: boolean;
+	showGroupCountsMobile: boolean;
+	enableDragAndDrop: boolean;
+	enableDragAndDropMobile: boolean;
 }
 
 const DEFAULT_SETTINGS: CgbSettings = {
 	enableCollapsibleGroups: true,
+	enableCollapsibleGroupsMobile: true,
 	rememberFoldState: true,
 	collapseAllByDefault: false,
 	showToolbarButtons: true,
+	showToolbarButtonsMobile: true,
 	toolbarButtonDisplay: 'both',
 	showGroupCounts: true,
+	showGroupCountsMobile: true,
+	enableDragAndDrop: true,
+	enableDragAndDropMobile: true,
 };
 
 type BasesGroup = {
@@ -90,11 +103,6 @@ type RuntimeContext = {
 	afterRender: () => void;
 };
 
-type WritableGroupField = {
-	property: string;
-	frontmatterKey: string;
-};
-
 type DragState = {
 	runtimeKind: RuntimeKind;
 	runtimeSourceKey: string;
@@ -103,6 +111,21 @@ type DragState = {
 	handleEl: HTMLElement;
 	sourceGroupValue: string;
 	dragPreviewEl?: HTMLElement | null;
+};
+
+type TouchDragState = {
+	pointerId: number;
+	runtime: RuntimeContext;
+	file: TFile;
+	rowEl: HTMLElement;
+	handleEl: HTMLElement;
+	sourceGroupValue: string;
+	startX: number;
+	startY: number;
+	lastX: number;
+	lastY: number;
+	activated: boolean;
+	holdTimer: number | null;
 };
 
 export default class CollapsibleGroupsPlugin extends Plugin {
@@ -114,9 +137,12 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 	private _embedVisibilityObservers: IntersectionObserver[] = [];
 	private _patchTimer: ReturnType<typeof setTimeout> | null = null;
 	private _refreshTimer: ReturnType<typeof setTimeout> | null = null;
+	private _dataRefreshTimer: number | null = null;
 	private _rerenderingEmbed: boolean = false;
 	private _styleEl: HTMLStyleElement | null = null;
 	private _boundPointerUp?: (e: PointerEvent) => void;
+	private _boundPointerMove?: (e: PointerEvent) => void;
+	private _boundPointerCancel?: (e: PointerEvent) => void;
 	private _patchedHeaders: Set<HTMLElement> = new Set();
 	private _lastHeaderCount: number = 0;
 	private _headerKeyCache: Map<HTMLElement, string> = new Map();
@@ -127,6 +153,7 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 	private _boundDrop?: (e: DragEvent) => void;
 	private _boundDragEnd?: (_e: DragEvent) => void;
 	private _dragState: DragState | null = null;
+	private _touchDragState: TouchDragState | null = null;
 	private _hoveredDropTable: HTMLElement | null = null;
 	private _dragMoveInFlight = false;
 	private _suppressHeaderToggleUntil = 0;
@@ -143,12 +170,38 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 		this._collapsedKeys = new Set(Object.keys(this._foldState));
 	}
 
+	private _isMobileUi(): boolean {
+		return !!(this.app as App & { isMobile?: boolean }).isMobile;
+	}
+
+	private _isFeatureEnabledOnCurrentDevice(enabled: boolean, mobileEnabled: boolean): boolean {
+		return isFeatureEnabledOnCurrentDevice(enabled, mobileEnabled, this._isMobileUi());
+	}
+
 	private _isGloballyEnabled(): boolean {
-		return this.settings.enableCollapsibleGroups;
+		return this._isFeatureEnabledOnCurrentDevice(
+			this.settings.enableCollapsibleGroups,
+			this.settings.enableCollapsibleGroupsMobile,
+		);
 	}
 
 	private _isRuntimeEnabled(): boolean {
 		return this._isGloballyEnabled() && this._getResolvedSettings().enableCollapsibleGroups;
+	}
+
+	private _isDragAndDropConfiguredEnabled(): boolean {
+		return this._isFeatureEnabledOnCurrentDevice(
+			this.settings.enableDragAndDrop,
+			this.settings.enableDragAndDropMobile,
+		);
+	}
+
+	private _isDragAndDropEnabled(): boolean {
+		return this._isDragAndDropConfiguredEnabled();
+	}
+
+	private _hasActiveRuntimeEnhancements(): boolean {
+		return this._isRuntimeEnabled() || this._isDragAndDropConfiguredEnabled();
 	}
 
 	private _isActiveGroupedBasesView(): boolean {
@@ -187,6 +240,10 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 		});
 	}
 
+	private _removeDragDomState(root: ParentNode = document) {
+		clearDragDomState(root);
+	}
+
 	private _getManagedLeaves(): WorkspaceLeaf[] {
 		const leaves: WorkspaceLeaf[] = [];
 		this.app.workspace.iterateAllLeaves(leaf => {
@@ -198,6 +255,13 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 
 	private _getGroupedViewInLeaf(leaf: WorkspaceLeaf | null | undefined): HTMLElement | null {
 		return (leaf?.view?.containerEl?.querySelector('.bases-view.is-grouped') as HTMLElement | null) ?? null;
+	}
+
+	private _isRenderableEmbedEl(embedEl: HTMLElement | null | undefined): embedEl is HTMLElement {
+		if (!embedEl?.isConnected) return false;
+		if (embedEl.classList.contains('is-loaded') === false) return false;
+		if (embedEl.offsetParent !== null) return true;
+		return embedEl.getClientRects().length > 0;
 	}
 
 	private _isGroupedTableView(table: BasesTableView | null | undefined, leaf?: WorkspaceLeaf | null): boolean {
@@ -337,6 +401,7 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 		}
 		if (type === 'markdown') {
 			return Array.from(leaf.view.containerEl?.querySelectorAll<HTMLElement>('.internal-embed.bases-embed') ?? [])
+				.filter(embedEl => this._isRenderableEmbedEl(embedEl))
 				.map(embedEl => this._getEmbedRuntime(embedEl))
 				.filter((runtime): runtime is RuntimeContext => !!runtime);
 		}
@@ -349,7 +414,7 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 	}
 
 	private _refreshActiveRuntimes() {
-		if (!this._isGloballyEnabled()) {
+		if (!this._hasActiveRuntimeEnhancements()) {
 			this._removeRuntimeDomState();
 			return;
 		}
@@ -366,9 +431,8 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 			for (const runtime of runtimes) {
 				this._applyCollapsedModel(runtime);
 			}
-			this._patchToolbars();
+			this._patchToolbars(runtimes);
 			this._patchHeaders();
-			for (const runtime of runtimes) this._patchDraggableRows(runtime);
 			requestAnimationFrame(() => {
 				if (hasDirectRuntime) {
 					this._directRefreshInFlight = false;
@@ -460,7 +524,7 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 
 
 		this.app.workspace.onLayoutReady(() => {
-			if (!this._isGloballyEnabled()) {
+			if (!this._hasActiveRuntimeEnhancements()) {
 				this._cleanupActiveRuntimes();
 				return;
 			}
@@ -477,7 +541,7 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 		// Listen for view opens to refresh when switching to grouped views
 		// Hide the active grouped view immediately, then restore after config/state is applied.
 		this.app.workspace.on('active-leaf-change', () => {
-			if (!this._isGloballyEnabled()) {
+			if (!this._hasActiveRuntimeEnhancements()) {
 				this._setInitializingState(false);
 				this._cleanupActiveRuntimes();
 				return;
@@ -510,7 +574,7 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 
 		this.registerEvent(this.app.workspace.on('file-open', (file) => {
 			window.setTimeout(async () => {
-				if (!this._isGloballyEnabled()) {
+				if (!this._hasActiveRuntimeEnhancements()) {
 					this._cleanupActiveRuntimes();
 					return;
 				}
@@ -525,6 +589,11 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 				else if (leafType === 'markdown') this._refreshEmbeddedInActiveLeaf();
 				else if (leafType === 'canvas') this._refreshCanvasLeaf();
 			}, 60);
+		}));
+
+		this.registerEvent(this.app.metadataCache.on('changed', (file) => {
+			if (!(file instanceof TFile) || file.extension !== 'md') return;
+			this._scheduleActiveRuntimeDataRefresh();
 		}));
 
 		// Watch for embedded bases appearing in the DOM
@@ -575,7 +644,7 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 	private _setupEmbedObserver() {
 		if (this._embedObserver) return;
 		this._embedObserver = new MutationObserver((mutations) => {
-			if (!this._isGloballyEnabled()) return;
+			if (!this._hasActiveRuntimeEnhancements()) return;
 			let hasNewGroupedView = false;
 			let hasNewEmbed = false;
 			for (const mutation of mutations) {
@@ -636,44 +705,50 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 	}
 
 	private _refreshCanvasLeaf() {
-		if (!this._isRuntimeEnabled()) return;
+		if (!this._hasActiveRuntimeEnhancements()) return;
 		const leaf = this.app.workspace.activeLeaf;
 		if (!leaf) return;
 		if (leaf.view?.getViewType() !== 'canvas') return;
-		this._patchToolbars();
-		this._patchHeaders();
+		const runtimes: RuntimeContext[] = [];
 		const canvasNodeEls = leaf.view.containerEl.querySelectorAll<HTMLElement>('.canvas-node');
 		canvasNodeEls.forEach(el => {
-			if (el.querySelector('.bases-view.is-grouped')) {
-				this._applyCanvasNodeCollapse(el);
-				const runtime = this._getCanvasRuntime(el);
-				if (runtime) this._patchDraggableRows(runtime);
-			}
+			if (!el.querySelector('.bases-view.is-grouped')) return;
+			this._applyCanvasNodeCollapse(el);
+			const runtime = this._getCanvasRuntime(el);
+			if (runtime) runtimes.push(runtime);
 		});
+		this._patchToolbars(runtimes);
+		this._patchHeaders();
+		for (const runtime of runtimes) this._patchDraggableRows(runtime);
 	}
 
 	private _refreshEmbeddedInActiveLeaf() {
-		if (!this._isRuntimeEnabled()) return;
+		if (!this._hasActiveRuntimeEnhancements()) return;
 		if (this._rerenderingEmbed) return;
 		const leaf = this.app.workspace.activeLeaf;
 		if (!leaf) return;
 		const container = leaf.view?.containerEl as HTMLElement | undefined;
 		if (!container) return;
-		const embedEls = container.querySelectorAll<HTMLElement>('.internal-embed.bases-embed');
+		const embedEls = Array.from(container.querySelectorAll<HTMLElement>('.internal-embed.bases-embed'))
+			.filter(embedEl => this._isRenderableEmbedEl(embedEl));
 		if (!embedEls.length) return;
-		this._patchToolbars();
+		const runtimes: RuntimeContext[] = [];
 		embedEls.forEach(embedEl => {
 			this._patchEmbedHeaders(embedEl);
 			this._applyEmbedCollapse(embedEl);
 			this._watchEmbedVisibility(embedEl);
 			const runtime = this._getEmbedRuntime(embedEl);
-			if (runtime) this._patchDraggableRows(runtime);
+			if (runtime) {
+				runtimes.push(runtime);
+				this._patchDraggableRows(runtime);
+			}
 			const notYetInitialized = !(embedEl as HTMLElement & { __cgbModelApplied?: boolean }).__cgbModelApplied;
 			if (notYetInitialized && !this._rerenderingEmbed) {
 				(embedEl as HTMLElement & { __cgbModelApplied?: boolean }).__cgbModelApplied = true;
 				this._applyCollapsedModelToEmbed(embedEl);
 			}
 		});
+		this._patchToolbars(runtimes);
 	}
 
 	/**
@@ -739,9 +814,11 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 			this._currentViewName ?? undefined
 		);
 
-		this._cachedResolvedSettings = resolved;
+		const mobileResolved = applyMobileResolvedOverrides(resolved, this.settings, this._isMobileUi());
+
+		this._cachedResolvedSettings = mobileResolved;
 		this._baseConfigCacheDirty = false;
-		return resolved;
+		return mobileResolved;
 	}
 
 	/**
@@ -793,7 +870,10 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 		}
 		if (this._patchTimer) clearTimeout(this._patchTimer);
 		if (this._refreshTimer) clearTimeout(this._refreshTimer);
+		if (this._dataRefreshTimer) clearTimeout(this._dataRefreshTimer);
 		if (this._boundPointerUp) document.removeEventListener('pointerup', this._boundPointerUp, true);
+		if (this._boundPointerMove) document.removeEventListener('pointermove', this._boundPointerMove, true);
+		if (this._boundPointerCancel) document.removeEventListener('pointercancel', this._boundPointerCancel, true);
 		if (this._boundDragOver) document.removeEventListener('dragover', this._boundDragOver, true);
 		if (this._boundDrop) document.removeEventListener('drop', this._boundDrop, true);
 		if (this._boundDragEnd) document.removeEventListener('dragend', this._boundDragEnd, true);
@@ -807,6 +887,7 @@ export default class CollapsibleGroupsPlugin extends Plugin {
 			el.removeAttribute('data-cgb-row-draggable');
 			el.removeAttribute('data-cgb-row-drag-cell');
 		});
+		this._clearTouchDragState();
 		this._clearDropTargetHighlight();
 		this._resetGroupedDataCache();
 		this._displayActiveTable();
@@ -846,11 +927,17 @@ export default class CollapsibleGroupsPlugin extends Plugin {
   background: color-mix(in srgb, var(--background-modifier-hover) 65%, transparent);
   box-shadow: inset 0 0 0 1px var(--interactive-accent);
 }
-.bases-tr[data-cgb-row-draggable="true"] > .bases-td:first-child { position: relative; }
-.bases-tr[data-cgb-row-draggable="true"] > .bases-td:first-child > .bases-table-cell { padding-left: 22px; }
+.bases-tr[data-cgb-row-draggable="true"] { position: absolute; }
+.bases-td[data-cgb-row-drag-cell="true"] > .bases-table-cell { padding-left: 22px; }
+.bases-td[data-cgb-row-drag-cell="true"] .metadata-property-value,
+.bases-td[data-cgb-row-drag-cell="true"] .metadata-input-longtext,
+.bases-td[data-cgb-row-drag-cell="true"] .metadata-input-text {
+  padding-left: 22px;
+  box-sizing: border-box;
+}
 .cgb-row-drag-handle {
   position: absolute;
-  inset-inline-start: 4px;
+  inset-inline-start: 6px;
   top: 50%;
   transform: translateY(-50%);
   display: inline-flex;
@@ -861,7 +948,13 @@ export default class CollapsibleGroupsPlugin extends Plugin {
   color: var(--text-muted);
   opacity: 0.9;
   cursor: grab;
-  z-index: 1;
+  z-index: 5;
+  pointer-events: auto;
+  background: var(--background-primary);
+  border-radius: 4px;
+  touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
 }
 .cgb-row-drag-handle:hover {
   color: var(--text-normal);
@@ -904,6 +997,23 @@ body.is-cgb-dragging * {
   background: var(--interactive-accent);
   flex-shrink: 0;
 }
+.cgb-settings-notice {
+  margin: 0 0 18px;
+  padding: 18px 20px;
+  border-radius: 16px;
+  background: color-mix(in srgb, var(--background-secondary) 82%, var(--background-primary));
+  color: var(--text-normal);
+}
+.cgb-settings-notice-title {
+  margin: 0 0 6px;
+  font-size: var(--font-ui-medium);
+  font-weight: var(--font-semibold);
+}
+.cgb-settings-notice-text {
+  margin: 0;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
 .bases-view.is-grouped[data-cgb-initializing="true"] { visibility: hidden; }
 .internal-embed .bases-view.is-grouped .bases-table[data-cgb-collapsed="true"] > .bases-tbody { display: none !important; }
 .internal-embed .bases-view.is-grouped .bases-table-container { overflow: visible !important; }
@@ -915,6 +1025,16 @@ body.is-cgb-dragging * {
 
 	private _bindDelegatedEvents() {
 		this._boundPointerUp = (e: PointerEvent) => {
+			if (this._touchDragState?.pointerId === e.pointerId) {
+				const tableEl = this._touchDragState.activated ? this._getDropTargetTableAtPoint(e.clientX, e.clientY) : null;
+				const shouldHandleDrop = !!tableEl && this._isTableValidDropTarget(tableEl);
+				e.preventDefault();
+				e.stopPropagation();
+				this._clearTouchDragState(false);
+				if (shouldHandleDrop) void this._handleRowDrop(tableEl);
+				else this._clearDragState();
+				return;
+			}
 			if (this._dragState || this._dragMoveInFlight || Date.now() < this._suppressHeaderToggleUntil) return;
 			const target = e.target as HTMLElement | null;
 			if (!target) return;
@@ -933,8 +1053,37 @@ body.is-cgb-dragging * {
 		};
 		document.addEventListener('pointerup', this._boundPointerUp, true);
 
+		this._boundPointerMove = (e: PointerEvent) => {
+			const touchDragState = this._touchDragState;
+			if (!touchDragState || touchDragState.pointerId !== e.pointerId) return;
+			touchDragState.lastX = e.clientX;
+			touchDragState.lastY = e.clientY;
+			if (!touchDragState.activated) {
+				const moved = Math.hypot(e.clientX - touchDragState.startX, e.clientY - touchDragState.startY);
+				if (moved > 8) this._clearTouchDragState();
+				return;
+			}
+			e.preventDefault();
+			e.stopPropagation();
+			this._moveTouchDragPreview(e.clientX, e.clientY);
+			const tableEl = this._getDropTargetTableAtPoint(e.clientX, e.clientY);
+			if (!tableEl || !this._isTableValidDropTarget(tableEl)) {
+				this._clearDropTargetHighlight();
+				return;
+			}
+			this._setDropTargetHighlight(tableEl);
+		};
+		document.addEventListener('pointermove', this._boundPointerMove, true);
+
+		this._boundPointerCancel = (e: PointerEvent) => {
+			if (this._touchDragState?.pointerId !== e.pointerId) return;
+			this._clearTouchDragState();
+			this._clearDragState();
+		};
+		document.addEventListener('pointercancel', this._boundPointerCancel, true);
+
 		this._boundDragOver = (e: DragEvent) => {
-			if (!this._dragState) return;
+			if (!this._isDragAndDropEnabled() || !this._dragState) return;
 			const target = e.target as HTMLElement | null;
 			const tableEl = target?.closest('.bases-table[data-cgb-drop-target="true"]') as HTMLElement | null;
 			if (!tableEl || !this._isTableValidDropTarget(tableEl)) {
@@ -949,7 +1098,7 @@ body.is-cgb-dragging * {
 		document.addEventListener('dragover', this._boundDragOver, true);
 
 		this._boundDrop = (e: DragEvent) => {
-			if (!this._dragState) return;
+			if (!this._isDragAndDropEnabled() || !this._dragState) return;
 			const target = e.target as HTMLElement | null;
 			const tableEl = target?.closest('.bases-table[data-cgb-drop-target="true"]') as HTMLElement | null;
 			this._suppressHeaderToggleUntil = Date.now() + 250;
@@ -1008,6 +1157,7 @@ body.is-cgb-dragging * {
 		const resolved = this._getResolvedSettings();
 		if (!resolved.enableCollapsibleGroups) {
 			this._cleanupRuntimeContext(runtime);
+			this._patchDraggableRows(runtime);
 			return;
 		}
 		if (!this._isGroupedTableView(runtime.table)) {
@@ -1024,74 +1174,50 @@ body.is-cgb-dragging * {
 	}
 
 	private _getWritableGroupField(table: BasesTableView): WritableGroupField | null {
-		const property = table.config?.groupBy?.property;
-		if (typeof property !== 'string' || !property.length) return null;
-		if (property.startsWith('file.')) return null;
-		const frontmatterKey = property.startsWith('note.') ? property.slice(5) : property;
-		if (!frontmatterKey || frontmatterKey.includes('.')) return null;
-		const lowered = frontmatterKey.toLowerCase();
-		if (['tags', 'aliases', 'cssclasses', 'position'].includes(lowered)) return null;
-		return { property, frontmatterKey };
+		return getWritableGroupField(table);
 	}
 
 	private _patchDraggableRows(runtime: RuntimeContext) {
-		const writableField = this._getWritableGroupField(runtime.table);
-		const headers = runtime.getHeaders();
-		for (const header of headers) {
-			const tableEl = header.closest('.bases-table') as HTMLElement | null;
-			if (writableField) {
-				header.setAttribute('data-cgb-drop-target', 'true');
-				tableEl?.setAttribute('data-cgb-drop-target', 'true');
-				tableEl?.classList.add('is-cgb-drop-target');
-			} else {
-				header.removeAttribute('data-cgb-drop-target');
-				tableEl?.removeAttribute('data-cgb-drop-target');
-				tableEl?.classList.remove('is-cgb-drop-target', 'is-cgb-drop-active');
-			}
+		const dragEnabled = this._isDragAndDropEnabled();
+		const writableField = dragEnabled ? this._getWritableGroupField(runtime.table) : null;
+		if (!writableField) {
+			syncDragDecorations(runtime.viewEl, runtime.getHeaders(), [], false);
+			return;
 		}
 
-		runtime.viewEl.querySelectorAll<HTMLElement>('.bases-tr[data-cgb-row-draggable="true"]').forEach(rowEl => {
-			if (!writableField) {
-				rowEl.removeAttribute('data-cgb-row-draggable');
-				rowEl.classList.remove('is-cgb-row-dragging');
-				rowEl.querySelector('.cgb-row-drag-handle')?.remove();
-			}
-		});
-		runtime.viewEl.querySelectorAll<HTMLElement>('[data-cgb-row-drag-cell]').forEach(cell => {
-			if (!writableField) cell.removeAttribute('data-cgb-row-drag-cell');
-		});
-		if (!writableField) return;
-
+		const rows = [];
 		for (const row of runtime.table.rows ?? []) {
 			const rowEl = row.el;
 			const file = row.entry?.file;
 			if (!rowEl || !(rowEl instanceof HTMLElement) || !file) continue;
 			if (!runtime.viewEl.contains(rowEl)) continue;
-			rowEl.setAttribute('data-cgb-row-draggable', 'true');
-			const firstCell = rowEl.querySelector<HTMLElement>(':scope > .bases-td');
-			if (!firstCell) continue;
-			firstCell.setAttribute('data-cgb-row-drag-cell', 'true');
-			let handle = firstCell.querySelector<HTMLElement>(':scope > .cgb-row-drag-handle');
-			if (!handle) {
-				handle = document.createElement('span');
-				handle.className = 'cgb-row-drag-handle';
-				handle.draggable = true;
-				handle.setAttribute('aria-label', 'Move row to another group');
-				handle.setAttribute('title', 'Drag to move row to another group');
-				handle.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M9 5h.01M9 12h.01M9 19h.01M15 5h.01M15 12h.01M15 19h.01"/></svg>`;
+			rows.push({
+				rowEl,
+				createHandle: () => {
+					const handle = document.createElement('span');
+					handle.className = 'cgb-row-drag-handle';
+					handle.draggable = true;
+					handle.setAttribute('aria-label', 'Move row to another group');
+					handle.setAttribute('title', 'Drag to move row to another group');
+					handle.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M9 5h.01M9 12h.01M9 19h.01M15 5h.01M15 12h.01M15 19h.01"/></svg>`;
 				handle.addEventListener('dragstart', event => {
-					this._onRowDragStart(event, runtime, rowEl, file, handle as HTMLElement);
+					this._onRowDragStart(event, runtime, rowEl, file, handle);
 				});
 				handle.addEventListener('dragend', () => {
 					this._clearDragState();
 				});
-				firstCell.prepend(handle);
-			}
+				handle.addEventListener('pointerdown', event => {
+					this._onRowHandlePointerDown(event, runtime, rowEl, file, handle);
+				});
+					return handle;
+				},
+			});
 		}
+		syncDragDecorations(runtime.viewEl, runtime.getHeaders(), rows, true);
 	}
 
 	private _onRowDragStart(event: DragEvent, runtime: RuntimeContext, rowEl: HTMLElement, file: TFile, handleEl: HTMLElement) {
-		if (this._dragMoveInFlight) {
+		if (!this._isDragAndDropEnabled() || this._dragMoveInFlight) {
 			event.preventDefault();
 			return;
 		}
@@ -1127,6 +1253,81 @@ body.is-cgb-dragging * {
 		}
 	}
 
+	private _onRowHandlePointerDown(event: PointerEvent, runtime: RuntimeContext, rowEl: HTMLElement, file: TFile, handleEl: HTMLElement) {
+		if (!this._shouldUseTouchDrag(event) || !this._isDragAndDropEnabled() || this._dragMoveInFlight) return;
+		const writableField = this._getWritableGroupField(runtime.table);
+		if (!writableField) return;
+		this._clearTouchDragState();
+		const sourceGroupValue = this._normalizeGroupValue(
+			rowEl.closest('.bases-table')?.querySelector('.bases-group-value')?.textContent?.trim(),
+		);
+		const touchDragState: TouchDragState = {
+			pointerId: event.pointerId,
+			runtime,
+			file,
+			rowEl,
+			handleEl,
+			sourceGroupValue,
+			startX: event.clientX,
+			startY: event.clientY,
+			lastX: event.clientX,
+			lastY: event.clientY,
+			activated: false,
+			holdTimer: null,
+		};
+		touchDragState.holdTimer = window.setTimeout(() => {
+			if (this._touchDragState?.pointerId !== touchDragState.pointerId) return;
+			this._activateTouchDrag();
+		}, 180);
+		this._touchDragState = touchDragState;
+		handleEl.setPointerCapture?.(event.pointerId);
+	}
+
+	private _shouldUseTouchDrag(event: PointerEvent): boolean {
+		if (event.pointerType === 'touch') return true;
+		return window.matchMedia?.('(pointer: coarse)').matches ?? false;
+	}
+
+	private _activateTouchDrag() {
+		const touchDragState = this._touchDragState;
+		if (!touchDragState || touchDragState.activated) return;
+		touchDragState.activated = true;
+		this._clearDragState();
+		this._dragState = {
+			runtimeKind: touchDragState.runtime.kind,
+			runtimeSourceKey: touchDragState.runtime.sourceKey,
+			file: touchDragState.file,
+			rowEl: touchDragState.rowEl,
+			handleEl: touchDragState.handleEl,
+			sourceGroupValue: touchDragState.sourceGroupValue,
+			dragPreviewEl: this._createDragPreview(touchDragState.file.basename, touchDragState.sourceGroupValue),
+		};
+		document.body.classList.add('is-cgb-dragging');
+		touchDragState.rowEl.classList.add('is-cgb-row-dragging');
+		touchDragState.handleEl.classList.add('is-cgb-active');
+		this._moveTouchDragPreview(touchDragState.lastX, touchDragState.lastY);
+	}
+
+	private _moveTouchDragPreview(x: number, y: number) {
+		const dragPreviewEl = this._dragState?.dragPreviewEl;
+		if (!dragPreviewEl) return;
+		dragPreviewEl.style.left = `${x + 12}px`;
+		dragPreviewEl.style.top = `${y - 12}px`;
+	}
+
+	private _getDropTargetTableAtPoint(x: number, y: number): HTMLElement | null {
+		const target = document.elementFromPoint(x, y) as HTMLElement | null;
+		return target?.closest('.bases-table[data-cgb-drop-target="true"]') as HTMLElement | null;
+	}
+
+	private _clearTouchDragState(clearDragState = true) {
+		if (!this._touchDragState) return;
+		if (this._touchDragState.holdTimer) clearTimeout(this._touchDragState.holdTimer);
+		this._touchDragState.handleEl.releasePointerCapture?.(this._touchDragState.pointerId);
+		this._touchDragState = null;
+		if (clearDragState) this._clearDragState();
+	}
+
 	private _createDragPreview(fileName: string, sourceGroupValue: string): HTMLElement | null {
 		const previewEl = document.createElement('div');
 		previewEl.className = 'cgb-drag-preview';
@@ -1144,6 +1345,7 @@ body.is-cgb-dragging * {
 	}
 
 	private _isTableValidDropTarget(tableEl: HTMLElement): boolean {
+		if (!this._isDragAndDropEnabled()) return false;
 		const runtime = this._getRuntimeForElement(tableEl);
 		if (!runtime || !this._dragState) return false;
 		return runtime.kind === this._dragState.runtimeKind &&
@@ -1202,7 +1404,38 @@ body.is-cgb-dragging * {
 		}, 80);
 	}
 
+	private _scheduleActiveRuntimeDataRefresh() {
+		if (!this._hasActiveRuntimeEnhancements()) return;
+		if (this._dataRefreshTimer) clearTimeout(this._dataRefreshTimer);
+		this._dataRefreshTimer = window.setTimeout(() => {
+			this._dataRefreshTimer = null;
+			const runtimes = this._getActiveRuntimes();
+			if (!runtimes.length) return;
+			for (const runtime of runtimes) {
+				this._invalidateGroupedCaches(runtime.table);
+				if (runtime.kind !== 'direct') {
+					runtime.table.queryController?.update?.();
+					runtime.table.onDataUpdated?.();
+				}
+			}
+			window.setTimeout(async () => {
+				const leafType = this.app.workspace.activeLeaf?.view?.getViewType?.();
+				if (leafType === 'bases') {
+					const baseFile = (this.app.workspace.activeLeaf?.view as { file?: TFile } | undefined)?.file ?? null;
+					await this._reloadActiveBasesLeaf(baseFile);
+					this._refreshActiveRuntimes();
+				}
+				else if (leafType === 'markdown') this._refreshEmbeddedInActiveLeaf();
+				else if (leafType === 'canvas') this._refreshCanvasLeaf();
+			}, 80);
+		}, 80);
+	}
+
 	private async _handleRowDrop(tableEl: HTMLElement) {
+		if (!this._isDragAndDropEnabled()) {
+			this._clearDragState();
+			return;
+		}
 		const dragState = this._dragState;
 		const runtime = this._getRuntimeForElement(tableEl);
 		if (!dragState || !runtime || !this._isTableValidDropTarget(tableEl)) {
@@ -1337,22 +1570,28 @@ body.is-cgb-dragging * {
 		}
 	}
 
-	private _patchToolbars() {
+	private _patchToolbars(runtimes: RuntimeContext[] = this._getActiveRuntimes()) {
+		const containers = Array.from(new Set(runtimes.map(runtime => runtime.viewEl)));
+		const removeToolbars = () => {
+			for (const container of containers) {
+				container.parentElement?.querySelector('.cgb-toolbar')?.remove();
+				container.removeAttribute('data-cgb-container-patched');
+			}
+		};
 		if (!this._isRuntimeEnabled()) {
-			document.querySelectorAll('.cgb-toolbar').forEach(el => el.remove());
+			removeToolbars();
 			return;
 		}
 		const resolved = this._getResolvedSettings();
 		if (!resolved.showToolbarButtons) {
-			document.querySelectorAll('.cgb-toolbar').forEach(el => el.remove());
+			removeToolbars();
 			return;
 		}
 		if (!resolved.enableCollapsibleGroups) {
-			document.querySelectorAll('.cgb-toolbar').forEach(el => el.remove());
+			removeToolbars();
 			return;
 		}
 
-		const containers = document.querySelectorAll<HTMLElement>('.bases-view.is-grouped');
 		for (let i = 0; i < containers.length; i++) {
 			const container = containers[i];
 			const parent = container.parentElement;
@@ -1687,17 +1926,9 @@ body.is-cgb-dragging * {
 
 		const table = runtime?.table ?? this._getCanvasTableView(canvasNodeEl);
 		if (!table?.data) return;
+		const sourceGroups = this._getOriginalGroupedData(table);
 
-		if (!table.__cgbOriginalGroupedData) {
-			const previousCache = table.data.groupedDataCache;
-			table.data.groupedDataCache = null;
-			table.__cgbOriginalGroupedData = (table.data.groupedData ?? []).map(group => ({
-				...group, entries: group.entries.slice(),
-			} as BasesGroup));
-			table.data.groupedDataCache = previousCache ?? null;
-		}
-
-		table.data.groupedDataCache = table.__cgbOriginalGroupedData.map(group => {
+		table.data.groupedDataCache = sourceGroups.map(group => {
 			const clone = { ...group } as BasesGroup;
 			const groupValue = this._normalizeGroupValue(this._groupValue(group));
 			const key = filePath ? `${filePath}::${groupValue}` : this._stateKey(groupValue);
@@ -1742,19 +1973,9 @@ body.is-cgb-dragging * {
 			return typeof m?.display === 'function' && Array.isArray(m?.groups) && !!m?.scrollEl;
 		}) as BasesTableView | undefined;
 		if (!table?.data) return;
+		const sourceGroups = this._getOriginalGroupedData(table);
 
-		// Save original data if not already saved
-		if (!table.__cgbOriginalGroupedData) {
-			const previousCache = table.data.groupedDataCache;
-			table.data.groupedDataCache = null;
-			table.__cgbOriginalGroupedData = (table.data.groupedData ?? []).map(group => ({
-				...group,
-				entries: group.entries.slice(),
-			} as BasesGroup));
-			table.data.groupedDataCache = previousCache ?? null;
-		}
-
-		table.data.groupedDataCache = table.__cgbOriginalGroupedData.map(group => {
+		table.data.groupedDataCache = sourceGroups.map(group => {
 			const clone = { ...group } as BasesGroup;
 			const groupValue = this._normalizeGroupValue(this._groupValue(group));
 			const key = `${src}::${groupValue}`;
@@ -1768,7 +1989,7 @@ body.is-cgb-dragging * {
 
 		this._rerenderingEmbed = true;
 		// Set the cache directly before display() so even the first render is correct
-		table.data.groupedDataCache = table.__cgbOriginalGroupedData!.map(group => {
+		table.data.groupedDataCache = sourceGroups.map(group => {
 			const clone = { ...group } as BasesGroup;
 			const groupValue = this._normalizeGroupValue(this._groupValue(group));
 			const key = `${src}::${groupValue}`;
@@ -1805,8 +2026,9 @@ body.is-cgb-dragging * {
 			// ALWAYS re-apply collapsed cache before updateVirtualDisplay
 			const src = embedEl.getAttribute('src') ?? '';
 			const resolved = self._getResolvedSettings();
-			if (this.data && this.__cgbOriginalGroupedData) {
-				this.data.groupedDataCache = this.__cgbOriginalGroupedData.map(group => {
+			if (this.data) {
+				const sourceGroups = self._getOriginalGroupedData(this);
+				this.data.groupedDataCache = sourceGroups.map(group => {
 					const clone = { ...group } as BasesGroup;
 					const groupValue = self._normalizeGroupValue(self._groupValue(group));
 					const key = `${src}::${groupValue}`;
@@ -2080,6 +2302,11 @@ body.is-cgb-dragging * {
 		delete table.__cgbGroupCountMap;
 	}
 
+	private _entryIdentity(entry: unknown): string {
+		const maybeEntry = entry as { file?: { path?: string }; frontmatter?: { title?: string } };
+		return maybeEntry?.file?.path ?? maybeEntry?.frontmatter?.title ?? '';
+	}
+
 	private _getOriginalGroupedData(table: BasesTableView): BasesGroup[] {
 		if (!table.data) return [];
 
@@ -2096,7 +2323,12 @@ body.is-cgb-dragging * {
 			table.__cgbOriginalGroupedData.length !== source.length ||
 			table.__cgbOriginalGroupedData.some((group, index) => {
 				const next = source[index];
-				return this._groupValue(group) !== this._groupValue(next) || group.entries.length !== next.entries.length;
+				if (this._groupValue(group) !== this._groupValue(next) || group.entries.length !== next.entries.length) {
+					return true;
+				}
+				return group.entries.some((entry, entryIndex) => {
+					return this._entryIdentity(entry) !== this._entryIdentity(next.entries[entryIndex]);
+				});
 			});
 
 		if (needsRefresh) {
@@ -2340,7 +2572,11 @@ body.is-cgb-dragging * {
 		await this.saveData(data);
 		// Mark cache as dirty since global settings changed
 		this._baseConfigCacheDirty = true;
-		if (!this.settings.enableCollapsibleGroups) {
+		if (!this._isFeatureEnabledOnCurrentDevice(this.settings.enableDragAndDrop, this.settings.enableDragAndDropMobile)) {
+			this._clearDragState();
+			this._removeDragDomState();
+		}
+		if (!this._hasActiveRuntimeEnhancements()) {
 			await this._disableRuntime();
 		} else {
 			this._syncCollapsedKeysFromFoldState();
@@ -2367,10 +2603,30 @@ class CgbSettingTab extends PluginSettingTab {
 		this.plugin = plugin;
 	}
 
+	private _refreshViews() {
+		(this.plugin as unknown as { _refreshActiveRuntimes: () => void })._refreshActiveRuntimes();
+	}
+
+	private async _saveAndRefresh(redisplay = false) {
+		await this.plugin.saveSettings();
+		this._refreshViews();
+		if (redisplay) this.display();
+	}
+
 	display() {
 		const { containerEl } = this;
 		containerEl.empty();
+		const noticeEl = containerEl.createDiv({ cls: 'cgb-settings-notice' });
+		noticeEl.createEl('p', {
+			cls: 'cgb-settings-notice-title',
+			text: 'Restart May Be Needed',
+		});
+		noticeEl.createEl('p', {
+			cls: 'cgb-settings-notice-text',
+			text: 'Some setting changes may require restarting Obsidian to fully take effect.',
+		});
 
+		containerEl.createEl('h3', { text: 'Toolbar' });
 
 		new Setting(containerEl)
 			.setName('Show feature toolbar')
@@ -2378,9 +2634,21 @@ class CgbSettingTab extends PluginSettingTab {
 			.addToggle(toggle =>
 				toggle.setValue(this.plugin.settings.showToolbarButtons).onChange(async value => {
 					this.plugin.settings.showToolbarButtons = value;
-					await this.plugin.saveSettings();
-					(this.plugin as unknown as { _refreshActiveRuntimes: () => void })._refreshActiveRuntimes();
+					await this._saveAndRefresh(true);
 				}),
+			);
+
+		new Setting(containerEl)
+			.setName('Enable toolbar on mobile')
+			.setDesc('Requires the desktop toolbar toggle to be enabled.')
+			.addToggle(toggle =>
+				toggle
+					.setValue(this.plugin.settings.showToolbarButtonsMobile)
+					.setDisabled(!this.plugin.settings.showToolbarButtons)
+					.onChange(async value => {
+						this.plugin.settings.showToolbarButtonsMobile = value;
+						await this._saveAndRefresh();
+					}),
 			);
 
 		new Setting(containerEl)
@@ -2389,54 +2657,99 @@ class CgbSettingTab extends PluginSettingTab {
 			.addDropdown(dropdown =>
 				dropdown
 					.addOption('icon', 'Icon only')
-					.addOption('text', 'Text only')
-					.addOption('both', 'Icon and text')
-					.setValue(this.plugin.settings.toolbarButtonDisplay)
-					.onChange(async value => {
-						this.plugin.settings.toolbarButtonDisplay = value as 'icon' | 'text' | 'both';
-						await this.plugin.saveSettings();
-						(this.plugin as unknown as { _refreshActiveRuntimes: () => void })._refreshActiveRuntimes();
+						.addOption('text', 'Text only')
+						.addOption('both', 'Icon and text')
+						.setValue(this.plugin.settings.toolbarButtonDisplay)
+						.onChange(async value => {
+							this.plugin.settings.toolbarButtonDisplay = value as 'icon' | 'text' | 'both';
+						await this._saveAndRefresh();
 					}),
 			);
 
 		containerEl.createEl('h3', { text: 'Collapsing Groups' });
 
-		new Setting(containerEl)
-			.setName('Apply collapsible groups by default')
-			.setDesc('Makes grouped Bases views collapsible unless a specific view overrides that default.')
-			.addToggle(toggle =>
-				toggle.setValue(this.plugin.settings.enableCollapsibleGroups).onChange(async value => {
-					this.plugin.settings.enableCollapsibleGroups = value;
-					await this.plugin.saveSettings();
-					if (value) {
-						(this.plugin as unknown as { _refreshActiveRuntimes: () => void })._refreshActiveRuntimes();
-					}
-					// When disabling: saveSettings already removed chevrons; don't re-patch
-				}),
-			);
+			new Setting(containerEl)
+				.setName('Apply collapsible groups by default')
+				.setDesc('Makes grouped Bases views collapsible unless a specific view overrides that default.')
+				.addToggle(toggle =>
+					toggle.setValue(this.plugin.settings.enableCollapsibleGroups).onChange(async value => {
+						this.plugin.settings.enableCollapsibleGroups = value;
+						await this._saveAndRefresh(true);
+					}),
+				);
 
-		new Setting(containerEl)
-			.setName('Remember collapse state')
-			.setDesc('Keep each group\'s collapsed or expanded state between sessions.')
-			.addToggle(toggle =>
-				toggle.setValue(this.plugin.settings.rememberFoldState).onChange(async value => {
-					this.plugin.settings.rememberFoldState = value;
-					await this.plugin.saveSettings();
-				}),
-			);
+			new Setting(containerEl)
+				.setName('Enable collapsible groups on mobile')
+				.setDesc('Requires desktop collapsible groups to be enabled.')
+				.addToggle(toggle =>
+					toggle
+						.setValue(this.plugin.settings.enableCollapsibleGroupsMobile)
+						.setDisabled(!this.plugin.settings.enableCollapsibleGroups)
+						.onChange(async value => {
+							this.plugin.settings.enableCollapsibleGroupsMobile = value;
+							await this._saveAndRefresh();
+						}),
+				);
+
+			new Setting(containerEl)
+				.setName('Remember collapse state')
+				.setDesc('Keep each group\'s collapsed or expanded state between sessions.')
+				.addToggle(toggle =>
+					toggle.setValue(this.plugin.settings.rememberFoldState).onChange(async value => {
+						this.plugin.settings.rememberFoldState = value;
+						await this.plugin.saveSettings();
+					}),
+				);
 
 		containerEl.createEl('h3', { text: 'Count by Group' });
 
+			new Setting(containerEl)
+				.setName('Show counts by default')
+				.setDesc('Shows record counts beside group names unless a specific view overrides that default.')
+				.addToggle(toggle =>
+					toggle.setValue(this.plugin.settings.showGroupCounts).onChange(async value => {
+						this.plugin.settings.showGroupCounts = value;
+						await this._saveAndRefresh(true);
+					}),
+				);
+
 		new Setting(containerEl)
-			.setName('Show counts by default')
-			.setDesc('Shows record counts beside group names unless a specific view overrides that default.')
+			.setName('Show counts on mobile')
+			.setDesc('Requires desktop group counts to be enabled.')
+				.addToggle(toggle =>
+					toggle
+						.setValue(this.plugin.settings.showGroupCountsMobile)
+						.setDisabled(!this.plugin.settings.showGroupCounts)
+						.onChange(async value => {
+							this.plugin.settings.showGroupCountsMobile = value;
+						await this._saveAndRefresh();
+					}),
+			);
+
+		containerEl.createEl('h3', { text: 'Drag and Drop Support' });
+
+		new Setting(containerEl)
+			.setName('Enable drag and drop between groups')
+			.setDesc('Show row drag handles and allow moving rows between groups in grouped Bases views.')
 			.addToggle(toggle =>
-				toggle.setValue(this.plugin.settings.showGroupCounts).onChange(async value => {
-					this.plugin.settings.showGroupCounts = value;
-					await this.plugin.saveSettings();
-					(this.plugin as unknown as { _refreshActiveRuntimes: () => void })._refreshActiveRuntimes();
+				toggle.setValue(this.plugin.settings.enableDragAndDrop).onChange(async value => {
+					this.plugin.settings.enableDragAndDrop = value;
+					await this._saveAndRefresh(true);
 				}),
 			);
 
+		new Setting(containerEl)
+			.setName('Enable drag and drop on mobile')
+			.setDesc('Requires desktop drag and drop to be enabled. Uses press and hold to activate.')
+			.addToggle(toggle =>
+				toggle
+					.setValue(this.plugin.settings.enableDragAndDropMobile)
+					.setDisabled(!this.plugin.settings.enableDragAndDrop)
+					.onChange(async value => {
+						this.plugin.settings.enableDragAndDropMobile = value;
+						await this._saveAndRefresh();
+					}),
+			);
+
+		}
 	}
-}

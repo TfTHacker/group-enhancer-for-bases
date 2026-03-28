@@ -1,0 +1,21 @@
+{
+	"extends": "../tsconfig.json",
+	"compilerOptions": {
+		"module": "CommonJS",
+		"target": "ES2022",
+		"outDir": "../.tmp-test",
+		"rootDir": "..",
+		"declaration": false,
+		"sourceMap": false,
+		"inlineSourceMap": false,
+		"inlineSources": false
+	},
+	"include": [
+		"../src/feature-gates.ts",
+		"../src/group-field.ts",
+		"../src/drag-dom.ts",
+		"../src/config-resolver.ts",
+		"./**/*.ts"
+	],
+	"exclude": []
+}

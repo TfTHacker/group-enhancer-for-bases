@@ -2,12 +2,18 @@
 
 Group Enhancer for Bases adds extra functionality to grouped views in [Obsidian Bases](https://obsidian.md/bases).
 
+Group Collapsing/Expanding
 <img src="screenshot.gif" width="400" />
+
+Drag and Drop between groups
+<img src="DragAndDrop.gif" width="400" />
+
 
 ## Features
 
 - Collapse and expand grouped sections
 - Collapse all / Expand all actions
+- Drag and drop rows between groups (mobile requires press and hold to activate)
 - Optional toolbar for grouped views
 - Optional record counts beside group names
 - Remembered collapse state between sessions

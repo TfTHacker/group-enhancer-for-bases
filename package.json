@@ -6,6 +6,7 @@
 	"scripts": {
 		"dev": "node esbuild.config.mjs",
 		"build": "node node_modules/typescript/lib/tsc.js -noEmit -skipLibCheck && node esbuild.config.mjs production",
+		"test": "rm -rf .tmp-test && node node_modules/typescript/lib/tsc.js -p test/tsconfig.json && node --test $(find .tmp-test/test -type f -name '*.test.js' | sort)",
 		"version": "node version-bump.mjs && git add manifest.json versions.json"
 	},
 	"keywords": [
