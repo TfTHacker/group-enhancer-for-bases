@@ -40,5 +40,4 @@ The release workflow publishes `main.js`, `manifest.json`, and `styles.css`. Do 
 - Treat direct `.base` views, markdown embeds, and canvas nodes as separate runtime paths. Verify fixes in each relevant runtime.
 - Markdown leaves can retain stale hidden `.internal-embed.bases-embed` nodes. When inspecting or patching embeds, only treat renderable visible embeds as active runtimes.
 - For grouped Bases bugs, compare live host state such as `groupedData`, `groupedDataCache`, and runtime/controller state before assuming the issue is CSS-only.
-- `TestingVault` is the primary live verification environment for this repo. Useful fixtures include `Sample 1.base`, `Sample 2.base`, `embed 2.md`, and `My Tasks.base`.
 - Release prep in this repo may mention the next version in `CHANGELOG.md` before `package.json`, `manifest.json`, and `versions.json` are bumped by the release process.
