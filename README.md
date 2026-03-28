@@ -2,11 +2,11 @@
 
 Group Enhancer for Bases adds extra functionality to grouped views in [Obsidian Bases](https://obsidian.md/bases).
 
-Group Collapsing/Expanding
-<img src="screenshot.gif" width="400" />
+**Group Collapsing/Expanding** <p/>
+<img src="screenshot.gif" width="500" />
 
-Drag and Drop between groups
-<img src="DragAndDrop.gif" width="400" />
+**Drag and Drop between groups** <p/>
+<img src="DragAndDrop.gif" width="500" />
 
 
 ## Features
