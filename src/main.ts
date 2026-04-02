@@ -928,17 +928,20 @@ export default class CollapsibleGroupsPlugin extends Plugin {
   box-shadow: inset 0 0 0 1px var(--interactive-accent);
 }
 .bases-tr[data-cgb-row-draggable="true"] { position: absolute; }
-.bases-td[data-cgb-row-drag-cell="true"] > .bases-table-cell { padding-left: 22px; }
+.bases-td[data-cgb-row-drag-cell="true"] {
+  position: relative;
+  padding-left: 22px;
+  box-sizing: border-box;
+}
 .bases-td[data-cgb-row-drag-cell="true"] .metadata-property-value,
 .bases-td[data-cgb-row-drag-cell="true"] .metadata-input-longtext,
 .bases-td[data-cgb-row-drag-cell="true"] .metadata-input-text {
-  padding-left: 22px;
-  box-sizing: border-box;
+  padding-left: 0 !important;
 }
 .cgb-row-drag-handle {
   position: absolute;
   inset-inline-start: 6px;
-  top: 50%;
+  top: calc(50% + 2px);
   transform: translateY(-50%);
   display: inline-flex;
   align-items: center;
@@ -1084,8 +1087,8 @@ body.is-cgb-dragging * {
 
 		this._boundDragOver = (e: DragEvent) => {
 			if (!this._isDragAndDropEnabled() || !this._dragState) return;
-			const target = e.target as HTMLElement | null;
-			const tableEl = target?.closest('.bases-table[data-cgb-drop-target="true"]') as HTMLElement | null;
+			const tableEl = this._getDropTargetTableFromTarget(e.target) ??
+				this._getDropTargetTableAtPoint(e.clientX, e.clientY);
 			if (!tableEl || !this._isTableValidDropTarget(tableEl)) {
 				this._clearDropTargetHighlight();
 				return;
@@ -1099,8 +1102,8 @@ body.is-cgb-dragging * {
 
 		this._boundDrop = (e: DragEvent) => {
 			if (!this._isDragAndDropEnabled() || !this._dragState) return;
-			const target = e.target as HTMLElement | null;
-			const tableEl = target?.closest('.bases-table[data-cgb-drop-target="true"]') as HTMLElement | null;
+			const tableEl = this._getDropTargetTableFromTarget(e.target) ??
+				this._getDropTargetTableAtPoint(e.clientX, e.clientY);
 			this._suppressHeaderToggleUntil = Date.now() + 250;
 			if (!tableEl || !this._isTableValidDropTarget(tableEl)) {
 				this._clearDropTargetHighlight();
@@ -1315,9 +1318,21 @@ body.is-cgb-dragging * {
 		dragPreviewEl.style.top = `${y - 12}px`;
 	}
 
+	private _getDropTargetTableFromTarget(target: EventTarget | null): HTMLElement | null {
+		const el = target instanceof HTMLElement ? target : null;
+		if (!el) return null;
+		const header = el.closest('.bases-group-heading[data-cgb-drop-target="true"]') as HTMLElement | null;
+		if (header) return header.closest('.bases-table[data-cgb-drop-target="true"]') as HTMLElement | null;
+		return el.closest('.bases-table[data-cgb-drop-target="true"]') as HTMLElement | null;
+	}
+
 	private _getDropTargetTableAtPoint(x: number, y: number): HTMLElement | null {
-		const target = document.elementFromPoint(x, y) as HTMLElement | null;
-		return target?.closest('.bases-table[data-cgb-drop-target="true"]') as HTMLElement | null;
+		const targets = document.elementsFromPoint(x, y) as HTMLElement[];
+		for (const target of targets) {
+			const tableEl = this._getDropTargetTableFromTarget(target);
+			if (tableEl) return tableEl;
+		}
+		return null;
 	}
 
 	private _clearTouchDragState(clearDragState = true) {
@@ -2037,7 +2052,12 @@ body.is-cgb-dragging * {
 					return clone;
 				});
 			}
-				const result = origUpdate();
+			const result = origUpdate();
+			const runtime = self._getEmbedRuntime(embedEl);
+			if (runtime) {
+				runtime.afterRender();
+				self._patchDraggableRows(runtime);
+			}
 			// After virtual display runs, repack table top positions using actual heights
 			requestAnimationFrame(() => { self._repackEmbedTables(embedEl); });
 			return result;

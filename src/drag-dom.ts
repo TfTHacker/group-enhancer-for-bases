@@ -49,8 +49,9 @@ export function syncDragDecorations(
 			cell.removeAttribute('data-cgb-row-drag-cell');
 			cell.querySelectorAll('.cgb-row-drag-handle').forEach(handleEl => handleEl.remove());
 		});
-		cells[0]?.setAttribute('data-cgb-row-drag-cell', 'true');
+		const dragCell = cells[0];
+		dragCell?.setAttribute('data-cgb-row-drag-cell', 'true');
 		rowEl.querySelectorAll(':scope > .cgb-row-drag-handle').forEach(handleEl => handleEl.remove());
-		rowEl.prepend(createHandle());
+		dragCell?.append(createHandle());
 	}
 }
