@@ -1,6 +1,6 @@
 {
 	"name": "obsidian-group-enhancer-for-bases",
-	"version": "0.1.3",
+	"version": "0.1.4",
 	"description": "Provides enhanced features for grouped views in Obsidian Bases.",
 	"main": "main.js",
 	"scripts": {
