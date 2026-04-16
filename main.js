@@ -47,7 +47,6 @@ var M=Object.defineProperty;var F=Object.getOwnPropertyDescriptor;var q=Object.g
 }
 .bases-tr[data-cgb-row-draggable="true"] { position: absolute; }
 .bases-td[data-cgb-row-drag-cell="true"] {
-  position: relative;
   padding-left: 22px;
   box-sizing: border-box;
 }

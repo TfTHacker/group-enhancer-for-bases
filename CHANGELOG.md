@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.1.5
+- Fixed first column text overflowing into adjacent columns in grouped Bases views — the drag cell's `position: relative` broke Obsidian's absolute-positioned column layout
+
 ## 0.1.4
 - Fixed drag handle alignment and spacing issues in direct Bases views when the first grouped column is a metadata field instead of `file.name`
 - Fixed delayed drag handle rendering in embedded Bases views while scrolling through virtualized rows
