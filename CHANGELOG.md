@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.6
+- **Fix: Visual layout broken for array wikilink groups** — `_normalizeGroupValue()` now strips `[[ ]]` wikilink brackets and converts `, ` separators to `\n`, matching DOM text format. Without this, `__cgbGroupCountMap` lookups failed, causing `tbody` height 0px and overlapping rows.
+- **Fix: Drag-and-drop from "None" group loses wikilink format** — When a row with no frontmatter value was dragged to a wikilink group, the value was written as a plain string instead of a wikilink array. Now infers wikilink format from the target group's raw key data.
+- **Fix: Multi-value array groups merged into single value** — Dragging to a multi-value wikilink group (e.g., `[Sprint A] + [v0.11]`) incorrectly wrote a single merged value. New `_extractGroupValues()` method uses the Bases key `.data` array to preserve individual values as separate frontmatter array items.
+
 ## 0.1.5
 - Fixed first column text overflowing into adjacent columns in grouped Bases views — the drag cell's `position: relative` broke Obsidian's absolute-positioned column layout
 
